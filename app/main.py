@@ -1,10 +1,5 @@
-# Trading bot complet – Solana (DexScreener + Jupiter)
-# - Seuil pump par défaut: 70% (ENTRY_THRESHOLD=0.70)
-# - 25% du capital par trade
-# - Stop-loss -10%, Trailing +30% (throwback 20%)
-# - Filtres: liquidité >=10 SOL, volume >=5 SOL (auto convertis en USD via prix SOL)
-# - Jusqu’à 4 positions en parallèle
-# - Notifications Telegram
+# main.py — Bot Solana (DexScreener + Jupiter Lite), endpoints corrigés + retries réseau
+# Paramètres inchangés : seuil pump, 25% capital, SL -10%, Trailing +30% (throwback 20%), 4 positions max, filtres liqu/vol, Telegram.
 
 import os, time, json, base64, requests, base58, math
 from datetime import datetime
@@ -38,10 +33,46 @@ MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))     # min n
 MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "10.0"))
 MIN_VOL_SOL              = float(os.getenv("MIN_VOL_SOL", "5.0"))
 
-# ==== Constantes Jupiter & réseaux ====
-JUP_API  = "https://quote-api.jup.ag/swap/v1"
-PRICE_API = "https://price.jup.ag/v4/price?ids=SOL"  # prix SOL en USD
+# ==== Jupiter & DexScreener (endpoints corrigés) ====
+# Jupiter Lite = endpoints publics stables
+JUP_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
+JUP_SWAP_URL  = "https://lite-api.jup.ag/swap/v1/swap"
+PRICE_API     = "https://lite-api.jup.ag/price/v3?ids=SOL"  # Price API v3
+
+# DexScreener : /search pour lister des paires, /tokens/v1/{chain}/{mint} pour suivre un token
+DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
+DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"  # + /{mint}
+
 WSOL = "So11111111111111111111111111111111111111112"
+
+# ==== Utilitaires HTTP (retries) ====
+def http_get(url, params=None, timeout=15, retries=3, backoff=0.6):
+    err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            err = e
+            if i < retries - 1:
+                time.sleep(backoff * (2 ** i))
+            else:
+                raise err
+
+def http_post(url, json_payload=None, timeout=20, retries=3, backoff=0.6):
+    err = None
+    for i in range(retries):
+        try:
+            r = requests.post(url, json=json_payload, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            err = e
+            if i < retries - 1:
+                time.sleep(backoff * (2 ** i))
+            else:
+                raise err
 
 # ==== Telegram ====
 def send(msg: str):
@@ -50,7 +81,8 @@ def send(msg: str):
     try:
         requests.get(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            params={"chat_id": CHAT, "text": msg}, timeout=10
+            params={"chat_id": CHAT, "text": msg},
+            timeout=10
         )
     except Exception as e:
         print("[error] telegram:", e)
@@ -71,25 +103,32 @@ kp = load_keypair()
 client = Client(RPC_URL)
 TZ = pytz.timezone(TZ_NAME)
 
-# ==== Prix SOL (USD) via Jupiter ====
+# ==== Prix SOL (USD) via Jupiter v3 ====
 def get_sol_usd() -> float:
     try:
-        r = requests.get(PRICE_API, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return float(data["data"]["SOL"]["price"])
+        r = http_get(PRICE_API, timeout=10)
+        data = r.json() or {}
+        sol = (data.get("data") or {}).get("SOL") or {}
+        for k in ("price", "priceUsd", "value", "usd"):
+            v = sol.get(k)
+            if v is not None:
+                return float(v)
+        raise KeyError("clé de prix introuvable")
     except Exception as e:
         print("[warn] prix SOL indisponible, fallback 150 USD", e)
         return 150.0
 
 # ==== DexScreener scan (pairs Solana) ====
-DEX_SCREENER_PAIRS = "https://api.dexscreener.com/latest/dex/pairs/solana"
-
 def fetch_pairs() -> list:
-    r = requests.get(DEX_SCREENER_PAIRS, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("pairs", [])
+    """Récupère ~30 paires via /search, puis filtre chainId='solana'."""
+    try:
+        r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
+        data = r.json() or {}
+        pairs = data.get("pairs", []) or []
+        return [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
+    except Exception as e:
+        print("[fetch_pairs error]", e)
+        return []
 
 def get_price_change_pct(pair: dict, window: str) -> float:
     pc = pair.get("priceChange", {})
@@ -108,10 +147,10 @@ def pair_volume_h24_usd(pair: dict) -> float:
     return float(vol.get("h24") or 0)
 
 def pair_price_in_sol(pair: dict, sol_usd: float) -> float:
-    # Retourne le prix du baseToken en SOL (si quote=SOL, on a priceNative; sinon on convertit via priceUsd)
+    # Retourne le prix du baseToken en SOL (si quote=SOL, utilise priceNative; sinon convertit via priceUsd)
     price_native = pair.get("priceNative")
     quote_sym = (pair.get("quoteToken") or {}).get("symbol", "")
-    if quote_sym.upper() in ("SOL", "WSOL") and price_native:
+    if quote_sym and quote_sym.upper() in ("SOL", "WSOL") and price_native:
         try:
             return float(price_native)
         except Exception:
@@ -135,8 +174,7 @@ def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippa
         "onlyDirectRoutes": "false",
         "asLegacyTransaction": "true",
     }
-    r = requests.get(f"{JUP_API}/quote", params=params, timeout=15)
-    r.raise_for_status()
+    r = http_get(JUP_QUOTE_URL, params=params, timeout=15)
     return r.json()
 
 def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True):
@@ -146,8 +184,7 @@ def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True
         "wrapAndUnwrapSol": wrap_unwrap_sol,
         "asLegacyTransaction": True,
     }
-    r = requests.post(f"{JUP_API}/swap", json=payload, timeout=20)
-    r.raise_for_status()
+    r = http_post(JUP_SWAP_URL, json_payload=payload, timeout=20)
     data = r.json()
     return data["swapTransaction"]  # base64
 
@@ -155,7 +192,10 @@ def sign_and_send(serialized_b64: str):
     tx_bytes = base64.b64decode(serialized_b64)
     tx = Transaction.deserialize(tx_bytes)
     tx.sign(kp)
-    resp = client.send_raw_transaction(tx.serialize(), opts=TxOpts(skip_preflight=True, preflight_commitment="processed"))
+    resp = client.send_raw_transaction(
+        tx.serialize(),
+        opts=TxOpts(skip_preflight=True, preflight_commitment="processed")
+    )
     return resp.get("result", resp) if isinstance(resp, dict) else resp
 
 # ==== Solde SOL ====
@@ -164,25 +204,32 @@ def get_balance_sol() -> float:
     lamports = resp["result"]["value"]
     return lamports / 1_000_000_000
 
-# ==== Balance token SPL ====
+# ==== Balance token SPL (via get_token_accounts_by_owner, jsonParsed) ====
 def get_token_balance(mint: str) -> int:
-    # retourne la balance en "amount" (entiers en plus petites unités) pour le mint donné
+    """Retourne la balance 'amount' (entiers, plus petites unités) pour le mint donné."""
     try:
-        params = {
-            "owner": str(kp.public_key),
-            "mint": mint
-        }
-        resp = client._provider.make_request("getTokenAccountsByOwner", str(kp.public_key), {"mint": mint}, {"encoding": "jsonParsed"})
-        # compat si on utilise _provider : on peut utiliser directement client.get_token_accounts_by_owner_json_parsed plus récent
-        if "result" not in resp or not resp["result"]["value"]:
+        resp = client.get_token_accounts_by_owner(
+            kp.public_key,
+            {"mint": mint},
+            commitment="confirmed",
+            encoding="jsonParsed",
+        )
+        vals = (resp.get("result") or {}).get("value") or []
+        if not vals:
             return 0
-        acct = resp["result"]["value"][0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
-        return int(acct["amount"])  # quantité en plus petites unités
+        # On agrège si plusieurs ATAs
+        total = 0
+        for v in vals:
+            info = (((v or {}).get("account") or {}).get("data") or {}).get("parsed", {})
+            amt = (((info.get("info") or {}).get("tokenAmount")) or {}).get("amount")
+            if amt is not None:
+                total += int(amt)
+        return total
     except Exception as e:
         print("[warn] get_token_balance:", e)
         return 0
 
-# ==== Positions ====
+# ==== Positions (mémoire simple en RAM) ====
 positions = {}  # mint -> dict(info)
 
 def open_positions_count() -> int:
@@ -232,20 +279,33 @@ def enter_trade(pair: dict, sol_usd: float):
         "opened_at": now_str(),
     }
 
+def close_position(mint: str, symbol: str, reason: str) -> bool:
+    # Vendre 100% du token -> SOL via Jupiter
+    try:
+        bal_amount = get_token_balance(mint)
+        if bal_amount <= 0:
+            send(f"{reason} {symbol}: aucun solde token détecté (déjà vendu ?)")
+            return True
+
+        q = jup_quote(mint, WSOL, int(bal_amount * 0.99), SLIPPAGE_BPS)  # 99% du solde par sécurité
+        sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
+        send(f"{reason} {symbol}\nTx: {sig}")
+        return True
+    except Exception as e:
+        send(f"❌ Vente {symbol} échouée: {e}")
+        return False
+
 def check_positions(sol_usd: float):
-    # Pour chaque position, on récupère le prix actuel et on applique SL / Trailing
+    # Pour chaque position, on récupère le prix actuel via tokens/v1/{mint} et on applique SL / Trailing
     to_close = []
-    for mint, pos in positions.items():
+    for mint, pos in list(positions.items()):
         symbol = pos["symbol"]
         entry  = pos["entry_price_sol"]
         peak   = pos["peak_price_sol"]
 
-        # Récupère la paire principale de ce mint via DexScreener
         try:
-            r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            pairs = data.get("pairs", [])
+            r = http_get(f"{DEX_TOKENS_BY_MINT}/{mint}", timeout=15)
+            pairs = r.json() or []
             if not pairs:
                 continue
             # choisir la paire avec meilleure liquidité
@@ -262,16 +322,25 @@ def check_positions(sol_usd: float):
             pos["peak_price_sol"] = price
             peak = price
 
-        # pertes depuis l'entrée
-        draw_from_entry = (entry - price) / entry
+        # pertes depuis l'entrée (stop-loss)
+        if entry and entry > 0:
+            draw_from_entry = (entry - price) / entry
+        else:
+            draw_from_entry = 0.0
+
         if draw_from_entry >= STOP_LOSS_PCT:
             if close_position(mint, symbol, "🛑 Stop-loss"):
                 to_close.append(mint)
             continue
 
-        # throwback depuis le plus haut
-        drop_from_peak = (peak - price) / peak if peak > 0 else 0.0
-        gain_from_entry = (price - entry) / entry
+        # throwback depuis le plus haut (trailing)
+        if peak and peak > 0:
+            drop_from_peak = (peak - price) / peak
+            gain_from_entry = (price - entry) / entry if entry else 0.0
+        else:
+            drop_from_peak = 0.0
+            gain_from_entry = 0.0
+
         if gain_from_entry >= TRAILING_TRIGGER_PCT and drop_from_peak >= TRAILING_THROWBACK_PCT:
             if close_position(mint, symbol, "✅ Trailing take-profit"):
                 to_close.append(mint)
@@ -279,22 +348,6 @@ def check_positions(sol_usd: float):
 
     for m in to_close:
         positions.pop(m, None)
-
-def close_position(mint: str, symbol: str, reason: str) -> bool:
-    # Vendre 100% du token -> SOL via Jupiter
-    try:
-        bal_amount = get_token_balance(mint)
-        if bal_amount <= 0:
-            send(f"{reason} {symbol}: aucun solde token détecté (déjà vendu ?)")
-            return True
-
-        q = jup_quote(mint, WSOL, int(bal_amount * 0.99), SLIPPAGE_BPS)  # 99% du solde par sécurité
-        sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send(f"{reason} {symbol}\nTx: {sig}")
-        return True
-    except Exception as e:
-        send(f"❌ Vente {symbol} échouée: {e}")
-        return False
 
 # ==== Scan de marché ====
 def scan_market():
@@ -331,6 +384,8 @@ def scan_market():
             if not can_open_more():
                 break
             base_mint = (p.get("baseToken") or {}).get("address")
+            if not base_mint:
+                continue
             if base_mint in positions:
                 continue  # déjà en position
             enter_trade(p, sol_usd)
