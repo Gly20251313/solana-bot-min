@@ -2,5 +2,5 @@ requests==2.32.3
 APScheduler==3.10.4
 pytz==2024.1
 solana==0.25.0
-solders==0.2.0
 base58==2.1.1
+solders==0.21.0
