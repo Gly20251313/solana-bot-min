@@ -1,19 +1,23 @@
+# Force rebuild (solana 0.25.0 + solders 0.2.x)
+
 import os
+import time
 import requests
 import base58
-from solana.keypair import Keypair
-from solana.rpc.api import Client
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
 import pytz
 
-# === Variables d'environnement ===
+# API solana 0.25.x
+from solana.keypair import Keypair
+from solana.rpc.api import Client
+
+# ====== Env ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT = os.getenv("TELEGRAM_CHAT_ID")
-TZ = os.getenv("TZ", "Europe/Paris")
+CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+TZ    = os.getenv("TZ", "Europe/Paris")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
-# === Fonction d'envoi Telegram ===
 def send(msg: str):
     if not TOKEN or not CHAT:
         print("[warn] Telegram non configuré")
@@ -27,50 +31,57 @@ def send(msg: str):
     except Exception as e:
         print("[error] telegram:", e)
 
-# === Chargement clé privée Phantom (Base58 forcé) ===
+# === Charge la clé privée Phantom (Base58 forcé) ===
 pk_str = os.getenv("SOLANA_PRIVATE_KEY")
 if not pk_str:
     raise ValueError("Variable SOLANA_PRIVATE_KEY non définie")
 
-try:
-    # Forçage Base58
-    secret = base58.b58decode(pk_str.strip())
-    print(f"[info] Clé Base58 forcée et décodée ({len(secret)} octets)")
-except Exception as e:
-    raise ValueError(f"Erreur décodage Base58: {e}")
-
-# Vérifie la longueur
+secret = base58.b58decode(pk_str.strip())
+print(f"[info] Clé Base58 décodée: {len(secret)} octets")
 if len(secret) != 64:
-    raise ValueError(f"Clé invalide: {len(secret)} octets au lieu de 64")
+    raise ValueError(f"Clé invalide: {len(secret)} octets — attendu 64 (secretKey seed+pub)")
 
 kp = Keypair.from_secret_key(secret)
-print(f"[debug] Public key générée: {kp.pubkey()}")
+print(f"[debug] Public key générée: {kp.public_key}")
 
-# === Client RPC Solana ===
+# === RPC client ===
 client = Client(RPC_URL)
 
-def get_wallet_balance():
-    try:
-        balance_resp = client.get_balance(kp.pubkey())
-        lamports = balance_resp["result"]["value"]
-        sol = lamports / 1_000_000_000
-        return sol
-    except Exception as e:
-        return f"[erreur lecture solde] {e}"
+def get_wallet_balance_sol() -> float:
+    resp = client.get_balance(kp.public_key)
+    lamports = resp["result"]["value"]  # solana 0.25 -> dict JSON
+    return lamports / 1_000_000_000
 
 def job_balance():
-    sol = get_wallet_balance()
-    send(f"💰 Solde wallet BOT: {sol} SOL (pubkey: {kp.pubkey()})")
+    try:
+        sol = get_wallet_balance_sol()
+        send(f"💰 Solde wallet BOT: {sol:.4f} SOL (pubkey: {kp.public_key})")
+    except Exception as e:
+        send(f"[erreur lecture solde] {e}")
 
-# === Planificateur ===
+# Message de démarrage + solde immédiat
+send("🚀 Bot prêt ✅ (Railway)")
+job_balance()
+
+# Scheduler (heartbeat + résumé)
 scheduler = BackgroundScheduler(timezone=pytz.timezone(TZ))
-scheduler.add_job(job_balance, 'interval', minutes=1)  # Vérifie toutes les minutes
+def heartbeat():
+    now = datetime.now(pytz.timezone(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[hb] {now}")
+scheduler.add_job(heartbeat, "interval", minutes=30, id="hb")
+scheduler.add_job(job_balance, "interval", minutes=5, id="bal")  # solde toutes les 5 min
 scheduler.start()
 
-# === Message démarrage ===
-send("🚀 Bot prêt ✅ (Railway)")
+# Boucle
+_running = True
+import signal
+def _stop(*_): 
+    global _running; _running = False
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
 
-# Garde le script actif
-import time
-while True:
+while _running:
     time.sleep(1)
+
+scheduler.shutdown()
+print("[exit] bye")
