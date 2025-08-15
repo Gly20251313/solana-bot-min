@@ -1,10 +1,11 @@
 # Force rebuild
+
 import os, time, requests, signal, json, re, base64, base58
 from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from solana.rpc.api import Client
-from solana.keypair import Keypair
+from solders.keypair import Keypair  # ✅ nouveau chemin pour Keypair
 
 # Variables d'environnement
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -26,28 +27,23 @@ def send(msg: str):
 
 def _decode_private_key(pk_str: str) -> bytes:
     pk_str = pk_str.strip()
-    # JSON d’octets: "[12,34,...]"
     if pk_str.startswith('[') and pk_str.endswith(']'):
         print("[debug] Clé détectée: JSON d’octets")
         arr = json.loads(pk_str)
         return bytes(arr)
-    # HEX pur
     if re.fullmatch(r'[0-9a-fA-F]+', pk_str):
         print("[debug] Clé détectée: HEX")
         return bytes.fromhex(pk_str)
-    # Base64
     try:
         decoded = base64.b64decode(pk_str, validate=True)
         print("[debug] Clé détectée: Base64")
         return decoded
     except Exception:
         pass
-    # Base58 (par défaut Phantom)
     print("[debug] Clé détectée: Base58")
     return base58.b58decode(pk_str)
 
 def get_wallet_balance():
-    """Récupère le solde du wallet BOT"""
     try:
         pk_str = os.getenv("SOLANA_PRIVATE_KEY")
         if not pk_str:
@@ -58,26 +54,25 @@ def get_wallet_balance():
         secret = _decode_private_key(pk_str)
         print(f"[debug] Longueur clé: {len(secret)} octets")
 
-        # 32 octets = seed; 64 octets = secretKey complet
-        if len(secret) == 32:
-            kp = Keypair.from_seed(secret)
-        elif len(secret) == 64:
-            kp = Keypair.from_secret_key(secret)
+        if len(secret) == 64:
+            kp = Keypair.from_bytes(secret)  # ✅ solders
+        elif len(secret) == 32:
+            kp = Keypair.from_seed(secret)   # ✅ solders
         else:
             return f"[erreur] Longueur clé inattendue: {len(secret)} octets"
 
         rpc_url = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
         print(f"[debug] RPC_URL: {rpc_url}")
-        print(f"[debug] Public key: {kp.public_key}")
+        print(f"[debug] Public key: {kp.pubkey()}")  # ✅ solders: .pubkey()
 
         client = Client(rpc_url)
-        resp = client.get_balance(kp.public_key)
+        resp = client.get_balance(kp.pubkey())
         print(f"[debug] Réponse RPC: {resp}")
 
         if "result" not in resp or "value" not in resp["result"]:
             return f"[erreur RPC] réponse inattendue: {resp}"
         balance_sol = resp["result"]["value"] / 1_000_000_000
-        return f"💰 Solde wallet BOT: {balance_sol:.4f} SOL (pubkey: {kp.public_key})"
+        return f"💰 Solde wallet BOT: {balance_sol:.4f} SOL (pubkey: {kp.pubkey()})"
     except Exception as e:
         err_msg = f"[erreur lecture solde] {e}"
         print(err_msg)
