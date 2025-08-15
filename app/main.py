@@ -1,11 +1,9 @@
-# Force rebuild
-
 import os, time, requests, signal, json, re, base64, base58
 from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from solana.rpc.api import Client
-from solders.keypair import Keypair  # ✅ API compatible solana==0.30.2
+from solders.keypair import Keypair  # API solders compatible solana 0.30.x
 
 # Variables d'environnement
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -15,7 +13,7 @@ TZ    = os.getenv("TZ", "Europe/Paris")
 def send(msg: str):
     """Envoie un message Telegram"""
     if not TOKEN or not CHAT:
-        print("[warn] Telegram not configured")
+        print("[warn] Telegram non configuré")
         return
     try:
         requests.get(
@@ -58,14 +56,13 @@ def get_wallet_balance():
         # Correction auto si clé 66 octets
         if len(secret) == 66:
             print("[fix] Clé de 66 octets détectée — tentative de correction")
-            # Hypothèse : 2 octets parasites à la fin → on garde les 64 premiers
             secret = secret[:64]
             print(f"[fix] Nouvelle longueur: {len(secret)} octets")
 
         if len(secret) == 64:
-            kp = Keypair.from_bytes(secret)  # ✅ solders
+            kp = Keypair.from_bytes(secret)
         elif len(secret) == 32:
-            kp = Keypair.from_seed(secret)   # ✅ solders
+            kp = Keypair.from_seed(secret)
         else:
             return f"[erreur] Longueur clé inattendue: {len(secret)} octets"
 
@@ -75,11 +72,15 @@ def get_wallet_balance():
 
         client = Client(rpc_url)
         resp = client.get_balance(kp.pubkey())
-        print(f"[debug] Réponse RPC: {resp}")
+        print(f"[debug] Réponse RPC type: {type(resp)} | {resp}")
 
-        if "result" not in resp or "value" not in resp["result"]:
-            return f"[erreur RPC] réponse inattendue: {resp}"
-        balance_sol = resp["result"]["value"] / 1_000_000_000
+        # Compat solders / dict
+        try:
+            lamports = resp.value  # objet GetBalanceResp
+        except AttributeError:
+            lamports = resp["result"]["value"]  # dict JSON
+
+        balance_sol = lamports / 1_000_000_000
         return f"💰 Solde wallet BOT: {balance_sol:.4f} SOL (pubkey: {kp.pubkey()})"
     except Exception as e:
         err_msg = f"[erreur lecture solde] {e}"
