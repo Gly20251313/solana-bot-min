@@ -53,6 +53,14 @@ def get_wallet_balance():
 
         secret = _decode_private_key(pk_str)
         print(f"[debug] Longueur clé: {len(secret)} octets")
+        print(f"[debug] Bytes: {list(secret)}")  # debug affichage
+
+        # Correction auto si clé 66 octets
+        if len(secret) == 66:
+            print("[fix] Clé de 66 octets détectée — tentative de correction")
+            # Hypothèse : 2 octets parasites à la fin → on garde les 64 premiers
+            secret = secret[:64]
+            print(f"[fix] Nouvelle longueur: {len(secret)} octets")
 
         if len(secret) == 64:
             kp = Keypair.from_bytes(secret)  # ✅ solders
@@ -63,7 +71,7 @@ def get_wallet_balance():
 
         rpc_url = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
         print(f"[debug] RPC_URL: {rpc_url}")
-        print(f"[debug] Public key: {kp.pubkey()}")  # ✅ solders: .pubkey()
+        print(f"[debug] Public key: {kp.pubkey()}")
 
         client = Client(rpc_url)
         resp = client.get_balance(kp.pubkey())
