@@ -1,121 +1,90 @@
-import os, time, requests, signal, json, re, base64, base58
-from datetime import datetime
-import pytz
+import os
+import base58
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
+from solana.keypair import Keypair
 from solana.rpc.api import Client
-from solders.keypair import Keypair  # API solders compatible solana 0.30.x
+import pytz
 
 # Variables d'environnement
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 TZ    = os.getenv("TZ", "Europe/Paris")
 
+# Fonction envoi Telegram
 def send(msg: str):
-    """Envoie un message Telegram"""
     if not TOKEN or not CHAT:
         print("[warn] Telegram non configuré")
         return
     try:
         requests.get(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            params={"chat_id": CHAT, "text": msg}, timeout=10
+            params={"chat_id": CHAT, "text": msg},
+            timeout=10
         )
     except Exception as e:
-        print("[error] telegram:", e)
+        print("[error] Telegram:", e)
 
+# Décodage clé privée
 def _decode_private_key(pk_str: str) -> bytes:
-    pk_str = pk_str.strip()
-    if pk_str.startswith('[') and pk_str.endswith(']'):
-        print("[debug] Clé détectée: JSON d’octets")
-        arr = json.loads(pk_str)
-        return bytes(arr)
-    if re.fullmatch(r'[0-9a-fA-F]+', pk_str):
-        print("[debug] Clé détectée: HEX")
-        return bytes.fromhex(pk_str)
     try:
-        decoded = base64.b64decode(pk_str, validate=True)
-        print("[debug] Clé détectée: Base64")
-        return decoded
+        return base58.b58decode(pk_str)
     except Exception:
-        pass
-    print("[debug] Clé détectée: Base58")
-    return base58.b58decode(pk_str)
-
-def get_wallet_balance():
-    try:
-        pk_str = os.getenv("SOLANA_PRIVATE_KEY")
-        if not pk_str:
-            msg = "[erreur] SOLANA_PRIVATE_KEY manquante"
-            print(msg)
-            return msg
-
-        secret = _decode_private_key(pk_str)
-        print(f"[debug] Longueur clé: {len(secret)} octets")
-        print(f"[debug] Bytes: {list(secret)}")  # debug affichage
-
-        # Correction auto si clé 66 octets
-        if len(secret) == 66:
-            print("[fix] Clé de 66 octets détectée — tentative de correction")
-            secret = secret[:64]
-            print(f"[fix] Nouvelle longueur: {len(secret)} octets")
-
-        if len(secret) == 64:
-            kp = Keypair.from_bytes(secret)
-        elif len(secret) == 32:
-            kp = Keypair.from_seed(secret)
-        else:
-            return f"[erreur] Longueur clé inattendue: {len(secret)} octets"
-
-        rpc_url = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
-        print(f"[debug] RPC_URL: {rpc_url}")
-        print(f"[debug] Public key: {kp.pubkey()}")
-
-        client = Client(rpc_url)
-        resp = client.get_balance(kp.pubkey())
-        print(f"[debug] Réponse RPC type: {type(resp)} | {resp}")
-
-        # Compat solders / dict
         try:
-            lamports = resp.value  # objet GetBalanceResp
-        except AttributeError:
-            lamports = resp["result"]["value"]  # dict JSON
+            # format JSON Phantom
+            import json
+            arr = json.loads(pk_str)
+            return bytes(arr)
+        except Exception as e:
+            raise ValueError(f"Format clé invalide: {e}")
 
-        balance_sol = lamports / 1_000_000_000
-        return f"💰 Solde wallet BOT: {balance_sol:.4f} SOL (pubkey: {kp.pubkey()})"
-    except Exception as e:
-        err_msg = f"[erreur lecture solde] {e}"
-        print(err_msg)
-        return err_msg
+# Lecture solde wallet
+def get_wallet_balance():
+    pk_str = os.getenv("SOLANA_PRIVATE_KEY")
+    if not pk_str:
+        return "[erreur] SOLANA_PRIVATE_KEY manquante"
+
+    secret = _decode_private_key(pk_str)
+    print(f"[debug] Longueur clé: {len(secret)} octets")
+    print(f"[debug] Bytes: {list(secret)}")
+
+    # Normaliser en seed 32 octets
+    if len(secret) >= 32:
+        seed32 = secret[:32]
+    else:
+        return f"[erreur] Clé trop courte ({len(secret)}B), besoin ≥ 32B"
+
+    kp = Keypair.from_seed(seed32)  # ✅
+
+    rpc_url = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+    print(f"[debug] RPC_URL: {rpc_url}")
+    print(f"[debug] Public key: {kp.pubkey()}")
+
+    client = Client(rpc_url)
+    resp = client.get_balance(kp.pubkey())
+    print(f"[debug] Réponse RPC: {resp}")
+
+    try:
+        lamports = resp.value
+    except AttributeError:
+        lamports = resp["result"]["value"]
+
+    balance_sol = lamports / 1_000_000_000
+    return f"💰 Solde wallet BOT: {balance_sol:.4f} SOL (pubkey: {kp.pubkey()})"
+
+# Tâche planifiée
+def job_balance():
+    send(get_wallet_balance())
 
 # Message de démarrage
 send("🚀 Bot prêt ✅ (Railway)")
 
-# Lecture du solde et envoi
-msg_balance = get_wallet_balance()
-send(msg_balance)
-print(f"[info] Message solde envoyé: {msg_balance}")
-
-# Scheduler : heartbeat + résumé 21:00
-scheduler = BackgroundScheduler(timezone=TZ)
-
-def heartbeat():
-    now = datetime.now(pytz.timezone(TZ)).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[hb] {now}")
-
-scheduler.add_job(heartbeat, "interval", minutes=30, id="hb")
-scheduler.add_job(lambda: send("📝 Résumé quotidien (placeholder)"), "cron", hour=21, minute=0, id="daily")
+# Scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone(TZ))
+scheduler.add_job(job_balance, 'interval', minutes=1)  # toutes les minutes pour test
 scheduler.start()
 
-_running = True
-def handle_stop(signum, frame):
-    global _running
-    _running = False
-
-signal.signal(signal.SIGTERM, handle_stop)
-signal.signal(signal.SIGINT, handle_stop)
-
-while _running:
+# Boucle infinie
+import time
+while True:
     time.sleep(1)
-
-scheduler.shutdown()
-print("[exit] bye")
