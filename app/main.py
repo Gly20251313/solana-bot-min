@@ -5,7 +5,7 @@ from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from solana.rpc.api import Client
-from solders.keypair import Keypair  # ✅ nouveau chemin pour Keypair
+from solders.keypair import Keypair  # ✅ API compatible solana==0.30.2
 
 # Variables d'environnement
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
