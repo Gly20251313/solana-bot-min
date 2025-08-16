@@ -1,15 +1,24 @@
-import os, time, json, base64, requests, base58, math, tempfile, shutil, logging, uuid
-from datetime import datetime, timedelta
+import os, time, json, base64, requests, base58, math, tempfile, shutil, logging, uuid, random
+from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 # ==== Solana (stack stable) ====
 from solana.keypair import Keypair           # solana==0.25.0
 from solana.rpc.api import Client
 from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
-from solana.rpc.commitment import Confirmed
+
+# ==========================
+# Helpers pour % et lecture ENV
+# ==========================
+def _pct(x: float) -> float:
+    """Accepte 0.70 (=70%) ou 70 (=70%)."""
+    try:
+        return x/100.0 if x > 1 else x
+    except Exception:
+        return x
 
 # ==========================
 # ENV & Réglages par défaut
@@ -19,11 +28,11 @@ CHAT    = os.getenv("TELEGRAM_CHAT_ID")
 TZ_NAME = os.getenv("TZ", "Europe/Paris")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
-ENTRY_THRESHOLD          = float(os.getenv("ENTRY_THRESHOLD", "0.70"))   # 70% par défaut
-POSITION_SIZE_PCT        = float(os.getenv("POSITION_SIZE_PCT", "0.25")) # 25% du capital par trade (A+)
-STOP_LOSS_PCT            = float(os.getenv("STOP_LOSS_PCT", "0.10"))     # -10%
-TRAILING_TRIGGER_PCT     = float(os.getenv("TRAILING_TRIGGER_PCT", "0.30"))  # +30%
-TRAILING_THROWBACK_PCT   = float(os.getenv("TRAILING_THROWBACK_PCT", "0.20")) # -20% du plus haut
+ENTRY_THRESHOLD          = _pct(float(os.getenv("ENTRY_THRESHOLD", "0.70")))   # 70% par défaut
+POSITION_SIZE_PCT        = _pct(float(os.getenv("POSITION_SIZE_PCT", "0.25"))) # 25% du capital par trade (A+)
+STOP_LOSS_PCT            = _pct(float(os.getenv("STOP_LOSS_PCT", "0.10")))     # -10%
+TRAILING_TRIGGER_PCT     = _pct(float(os.getenv("TRAILING_TRIGGER_PCT", "0.30")))  # +30%
+TRAILING_THROWBACK_PCT   = _pct(float(os.getenv("TRAILING_THROWBACK_PCT", "0.20"))) # -20% du plus haut
 MAX_OPEN_TRADES          = int(os.getenv("MAX_OPEN_TRADES", "4"))
 SCAN_INTERVAL_SEC        = int(os.getenv("SCAN_INTERVAL_SEC", "30"))     # scan toutes les 30s
 PRICE_WINDOW             = os.getenv("PRICE_WINDOW", "h1")               # m5 | h1 | h6 | h24
@@ -34,15 +43,18 @@ HEARTBEAT_MINUTES        = int(os.getenv("HEARTBEAT_MINUTES", "30"))     # demi-
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 POSITIONS_PATH           = os.getenv("POSITIONS_PATH", "./positions.json")
 BLACKLIST_PATH           = os.getenv("BLACKLIST_PATH", "./blacklist.json")
+SWAP_ERRS_PATH           = os.getenv("SWAP_ERRS_PATH", "./swap_errs.json")
 ALLOW_A_TRADES           = os.getenv("ALLOW_A_TRADES", "0") == "1"      # par défaut on ne trade que A+
 
 # Filtres sécurité, définis en SOL puis convertis en USD via prix SOL live
 MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "10.0"))
 MIN_VOL_SOL              = float(os.getenv("MIN_VOL_SOL", "5.0"))
 MIN_POOL_AGE_SEC         = int(os.getenv("MIN_POOL_AGE_SEC", str(2*60*60)))  # 2h
+MIN_NOTIONAL_USD         = float(os.getenv("MIN_NOTIONAL_USD", "10"))
+GAS_RESERVE_SOL          = float(os.getenv("GAS_RESERVE_SOL", "0.05"))
 
 # Circuit breakers
-DAILY_MAX_DRAWDOWN_PCT   = float(os.getenv("DAILY_MAX_DRAWDOWN_PCT", "0.05"))  # 5%
+DAILY_MAX_DRAWDOWN_PCT   = _pct(float(os.getenv("DAILY_MAX_DRAWDOWN_PCT", "0.05")))  # 5%
 MAX_CONSEC_SWAP_ERR      = int(os.getenv("MAX_CONSEC_SWAP_ERR", "3"))
 
 # Logs
@@ -157,7 +169,12 @@ def poll_telegram():
                 global _running
                 _running = False
             elif text.lower().startswith("/status"):
-                send(f"ℹ️ Status {now_str()} | positions: {len(positions)} | blacklist: {len(BLACKLIST)}")
+                send(
+                    f"ℹ️ {now_str()}\n"
+                    f"Pos: {len(positions)} | Blacklist: {len(BLACKLIST)}\n"
+                    f"Seuil: {int(ENTRY_THRESHOLD*100)}% | A: {'ON' if ALLOW_A_TRADES else 'OFF'} | Dry: {'ON' if DRY_RUN else 'OFF'}\n"
+                    f"Scan: {SCAN_INTERVAL_SEC}s | Slippage: {SLIPPAGE_BPS/100:.2f}% | Probe: {PROBE_SOL} SOL"
+                )
         if last != offset:
             save_tg_offset(last)
     except Exception as e:
@@ -166,6 +183,12 @@ def poll_telegram():
 # ============
 # Clé / Client
 # ============
+def assert_env():
+    missing = [k for k in ["SOLANA_PRIVATE_KEY","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"] if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(f"ENV manquantes: {', '.join(missing)}")
+
+
 def load_keypair() -> Keypair:
     pk_str = os.getenv("SOLANA_PRIVATE_KEY")
     if not pk_str:
@@ -177,6 +200,7 @@ def load_keypair() -> Keypair:
     logger.info(f"[boot] Public key: {kp.public_key}")
     return kp
 
+assert_env()
 kp = load_keypair()
 client = Client(RPC_URL)
 TZ = pytz.timezone(TZ_NAME)
@@ -242,16 +266,29 @@ def load_blacklist():
         logger.warning(f"load_blacklist: {e}")
         BLACKLIST = {}
 
+
+def save_swap_errs():
+    try:
+        atomic_write_json(SWAP_ERRS_PATH, SWAP_ERRS)
+    except Exception:
+        pass
+
+def load_swap_errs():
+    global SWAP_ERRS
+    try:
+        if os.path.exists(SWAP_ERRS_PATH):
+            SWAP_ERRS = json.load(open(SWAP_ERRS_PATH)) or {}
+    except Exception:
+        SWAP_ERRS = {}
+
 # ==============
 # Prix SOL (USD)
 # ==============
 
 def get_sol_usd() -> float:
     try:
-        # V3: mapping { <mint>: { usdPrice, ... } }
         r = http_get(PRICE_API, timeout=10)
         data = r.json() or {}
-
         entry = None
         if isinstance(data, dict) and WSOL in data:
             entry = data.get(WSOL)
@@ -259,13 +296,11 @@ def get_sol_usd() -> float:
             dd = data.get("data")
             if isinstance(dd, dict):
                 entry = dd.get(WSOL)
-
         if not entry:
             raise KeyError("entrée WSOL absente")
         price = entry.get("usdPrice")
         if price is None:
             raise KeyError("usdPrice manquant")
-
         return float(price)
     except Exception as e:
         logger.warning(f"prix SOL indisponible, fallback 150 USD: {e}")
@@ -276,7 +311,7 @@ def get_sol_usd() -> float:
 # =============
 
 def fetch_pairs() -> list:
-    """Récupère ~30 paires via /search (q=SOL/USDC), puis filtre chainId='solana'."""
+    """Récupère des paires via /search (q=solana), puis filtre chainId='solana'."""
     try:
         r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
         data = r.json() or {}
@@ -374,6 +409,15 @@ def route_is_whitelisted(quote: dict) -> bool:
             if label not in ALLOWED_PROTOCOLS:
                 return False
     return bool(labels)
+
+
+def quote_sane(q: dict) -> bool:
+    try:
+        oa = int(q.get("outAmount", "0"))
+        pi = abs(float(q.get("priceImpactPct", 0)))  # 0..1
+        return oa > 0 and pi < 0.50
+    except Exception:
+        return False
 
 
 def sign_and_send(serialized_b64: str):
@@ -479,13 +523,15 @@ def probe_trade(mint: str, user_pubkey: str) -> bool:
     try:
         lamports = int(PROBE_SOL * 1_000_000_000)
         q_buy = jup_quote(WSOL, mint, lamports, SLIPPAGE_BPS)
-        if not q_buy or not route_is_whitelisted(q_buy):
+        if not q_buy or not (route_is_whitelisted(q_buy) and quote_sane(q_buy)):
             return False
-        if not DRY_RUN:
+        if DRY_RUN:
+            send(f"🔍 Probe (dry-run) {mint[:6]}… — validation logique uniquement")
+        else:
             txb = jup_swap_tx(q_buy, user_pubkey)
             sign_and_send(txb)
         q_sell = jup_quote(mint, WSOL, int(lamports*0.95), SLIPPAGE_BPS)
-        if not q_sell or not route_is_whitelisted(q_sell):
+        if not q_sell or not (route_is_whitelisted(q_sell) and quote_sane(q_sell)):
             return False
         if not DRY_RUN:
             txs = jup_swap_tx(q_sell, user_pubkey)
@@ -509,16 +555,20 @@ def score_pair(chg_pct: float, liq_usd: float, vol_usd: float, age_sec: float, m
     return "A" if soft else "B"
 
 
-def size_for_score(balance_sol: float, score: str) -> float:
+def size_for_score(balance_sol: float, score: str, sol_usd: float) -> float:
+    if balance_sol <= GAS_RESERVE_SOL:
+        return 0.0
     if score == "A+":
-        pct = POSITION_SIZE_PCT
+        pct = min(max(POSITION_SIZE_PCT, 0.01), 0.40)  # 1%–40%
     elif score == "A" and ALLOW_A_TRADES:
         pct = 0.15
     else:
         return 0.0
-    size_sol = max(balance_sol * pct, MIN_TRADE_SOL)
-    if size_sol > balance_sol * 0.99:
-        size_sol = balance_sol * 0.99
+    spendable = max(0.0, balance_sol - GAS_RESERVE_SOL)
+    size_sol = max(spendable * pct, MIN_TRADE_SOL)
+    size_sol = min(size_sol, spendable)
+    if size_sol * sol_usd < MIN_NOTIONAL_USD:
+        return 0.0
     return max(0.0, size_sol)
 
 # =================
@@ -540,7 +590,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         return
 
     balance = get_balance_sol()
-    size_sol = size_for_score(balance, score)
+    size_sol = size_for_score(balance, score, sol_usd)
     if size_sol <= 0:
         return
 
@@ -558,8 +608,8 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
             return
 
         q = jup_quote(WSOL, base_mint, lamports, SLIPPAGE_BPS)
-        if not route_is_whitelisted(q):
-            send(f"⛔ Route non whitelist pour {base_sym} — rejet")
+        if not (route_is_whitelisted(q) and quote_sane(q)):
+            send(f"⛔ Quote/route non satisfaisante pour {base_sym} — rejet")
             return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
         send(
@@ -570,6 +620,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         )
     except Exception as e:
         SWAP_ERRS[base_mint] = SWAP_ERRS.get(base_mint, 0) + 1
+        save_swap_errs()
         if SWAP_ERRS[base_mint] >= MAX_CONSEC_SWAP_ERR:
             blacklist(base_mint, hours=6)
             send(f"⚠️ {base_sym}: {SWAP_ERRS[base_mint]} erreurs swap → cooldown 6h (blacklist)")
@@ -597,15 +648,17 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
             return True
 
         q = jup_quote(mint, WSOL, int(bal_amount * 0.99), SLIPPAGE_BPS)
-        if not route_is_whitelisted(q):
-            send(f"⛔ Route non whitelist à la vente pour {symbol} — tentative annulée")
+        if not (route_is_whitelisted(q) and quote_sane(q)):
+            send(f"⛔ Route/quote non satisfaisante à la vente pour {symbol} — tentative annulée")
             return False
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
         send(f"{reason} {symbol}\nTx: {sig}")
         SWAP_ERRS[mint] = 0
+        save_swap_errs()
         return True
     except Exception as e:
         SWAP_ERRS[mint] = SWAP_ERRS.get(mint, 0) + 1
+        save_swap_errs()
         if SWAP_ERRS[mint] >= MAX_CONSEC_SWAP_ERR:
             blacklist(mint, hours=6)
             send(f"⚠️ {symbol}: {SWAP_ERRS[mint]} erreurs swap → cooldown 6h (blacklist)")
@@ -661,14 +714,26 @@ def check_positions(sol_usd: float):
 # =====================
 # Scan de marché (loop)
 # =====================
+GLOBAL_ERRS = {"count": 0, "until": 0.0}
+
+
+def bump_global_err():
+    GLOBAL_ERRS["count"] += 1
+    if GLOBAL_ERRS["count"] >= 5:
+        GLOBAL_ERRS["until"] = time.time() + 15*60  # 15 min cooldown
+        GLOBAL_ERRS["count"] = 0
+        send("🧊 Cooldown global 15min (trop d’erreurs)")
+
+
+def can_trade_now() -> bool:
+    return time.time() >= GLOBAL_ERRS["until"]
 
 
 def scan_market():
-    global HALT_TRADING
     try:
         poll_telegram()  # kill-switch & status
 
-        if HALT_TRADING:
+        if not can_trade_now():
             return
 
         sol_usd = get_sol_usd()
@@ -686,7 +751,7 @@ def scan_market():
             if liq_usd < min_liq_usd or vol_usd < min_vol_usd:
                 continue
             age = pair_age_sec(p)
-            if age < MIN_POOL_AGE_SEC:
+            if age <= 0 or age < MIN_POOL_AGE_SEC:
                 continue
             chg = get_price_change_pct(p, PRICE_WINDOW)
             if math.isnan(chg):
@@ -707,7 +772,11 @@ def scan_market():
 
         check_positions(sol_usd)
 
+        # petit jitter pour éviter le pattern exact
+        time.sleep(min(0.7, SCAN_INTERVAL_SEC/3))
+
     except Exception as e:
+        bump_global_err()
         err = f"[scan error] {type(e).__name__}: {e}"
         logger.error(err)
         send(f"⚠️ {err}")
@@ -801,6 +870,10 @@ def boot_message():
         f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h\n"
         f"Solde: {b:.4f} SOL"
     )
+    send(
+        f"⚙️ Config: A_trades={'ON' if ALLOW_A_TRADES else 'OFF'} | DRY_RUN={'ON' if DRY_RUN else 'OFF'} | "
+        f"Probe={PROBE_SOL} SOL | Reserve gaz={GAS_RESERVE_SOL} SOL | Notional≥${MIN_NOTIONAL_USD}"
+    )
 
 # =====================
 # Init & Scheduler
@@ -808,6 +881,7 @@ def boot_message():
 
 load_positions()
 load_blacklist()
+load_swap_errs()
 boot_message()
 send_boot_diagnostics()
 
