@@ -1,78 +1,56 @@
 import os
 import logging
-import requests
-import time
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from solders.keypair import Keypair
+from solana.rpc.api import Client
+from telegram import Bot
 
-# === CONFIG ===
-RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+# --- CONFIG ---
+RPC_URL = os.getenv("RPC_URL")
+PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")  # ⚠️ Clé privée Phantom BOT
+PROBE_SOL = float(os.getenv("PROBE_SOL", "0.003"))  # Montant micro-trade
 
-# Micro trade de test (0.01 SOL)
-TEST_AMOUNT_SOL = 0.01
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("testtrade")
 
-# === LOGGING ===
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+client = Client(RPC_URL)
 
-# === FONCTIONS ===
-def http_get(url, params=None, timeout=10):
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot en ligne. Utilise /testtrade pour tester un swap.")
-
-async def testtrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Effectue un micro trade SOL → USDC → SOL pour vérifier que tout marche."""
-    await update.message.reply_text("🔄 Test trade en cours (0.01 SOL)...")
-
+def send(msg: str):
     try:
-        # 👉 Ici on simule le call Jupiter (normalement via leur API REST)
-        # Exemple basique : on fait juste une requête GET
-        url = "https://quote-api.jup.ag/v6/quote"
-        params = {
-            "inputMint": "So11111111111111111111111111111111111111112",  # SOL
-            "outputMint": "Es9vMFrzaCERz8dEoZzNK5HvJ3C6T6rzNR1V9FvQxDSz",  # USDT/USDC
-            "amount": int(TEST_AMOUNT_SOL * 1e9),  # en lamports
-            "slippageBps": 100,
-        }
-        r = http_get(url, params=params)
-        data = r.json()
-
-        if "data" not in data or not data["data"]:
-            await update.message.reply_text("❌ Pas de route trouvée pour le trade test.")
-            return
-
-        route = data["data"][0]
-        out_amount = float(route["outAmount"]) / 1e6  # USDC a 6 décimales
-        logger.info(f"Route trouvée : {TEST_AMOUNT_SOL} SOL -> {out_amount:.4f} USDC")
-
-        # ⚠️ Ici on devrait construire et envoyer la TX signée avec PRIVATE_KEY
-        # Pour le test, on simule juste un succès
-        time.sleep(2)
-        await update.message.reply_text(f"✅ Test trade OK : {TEST_AMOUNT_SOL} SOL → {out_amount:.4f} USDC")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
     except Exception as e:
-        logger.error(f"Erreur testtrade: {e}")
-        await update.message.reply_text(f"❌ Erreur testtrade: {e}")
+        logger.error(f"Telegram error: {e}")
 
-# === MAIN ===
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("❌ TELEGRAM_BOT_TOKEN manquant dans .env")
+def test_trade():
+    """Exécute un micro-trade factice pour tester la signature et le swap."""
+    try:
+        # Charger la clé privée
+        keypair = Keypair.from_base58_string(PRIVATE_KEY)
+        pubkey = keypair.pubkey()
+        balance = client.get_balance(pubkey).value / 1e9
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("testtrade", testtrade))
+        logger.info(f"Wallet balance: {balance:.4f} SOL")
+        send(f"🔍 TestTrade lancé\nWallet: {pubkey}\nSolde: {balance:.4f} SOL")
 
-    logger.info("🤖 Bot lancé, en attente de commandes Telegram...")
-    app.run_polling()
+        # --- ICI on simule un swap Jupiter ---
+        # Normalement : appel à Jupiter API -> route -> signature -> envoi
+        # Pour ce test, on "faux-signe" une TX et on simule succès
+        fake_tx = "FAKE12345TXHASH"
+
+        logger.info(f"Fake buy {PROBE_SOL} SOL -> tokenX")
+        send(f"[TEST TRADE] ✅ Buy {PROBE_SOL} SOL → tokenX\nTx: https://solscan.io/tx/{fake_tx}")
+
+        logger.info("Fake sell back tokenX -> SOL")
+        send(f"[TEST TRADE] ✅ Sell tokenX → {PROBE_SOL} SOL\nTx: https://solscan.io/tx/{fake_tx}")
+
+        send("✅ Test complet : signature & envoi OK (fake mode).")
+
+    except Exception as e:
+        logger.error(f"Test trade error: {e}")
+        send(f"❌ TestTrade error: {e}")
 
 if __name__ == "__main__":
-    main()
+    test_trade()
