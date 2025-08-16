@@ -1,5 +1,5 @@
 requests==2.32.3
-APScheduler==3.10.4
+APScheduler==3.6.3
 pytz==2024.1
 solana==0.25.0
 base58==2.1.1
