@@ -30,14 +30,15 @@ def test_trade():
         # Charger la clé privée
         keypair = Keypair.from_base58_string(PRIVATE_KEY)
         pubkey = keypair.pubkey()
-        balance = client.get_balance(pubkey).value / 1e9
+
+        # ✅ Correction : accès dict JSON
+        resp = client.get_balance(pubkey)
+        balance = resp["result"]["value"] / 1e9
 
         logger.info(f"Wallet balance: {balance:.4f} SOL")
         send(f"🔍 TestTrade lancé\nWallet: {pubkey}\nSolde: {balance:.4f} SOL")
 
         # --- ICI on simule un swap Jupiter ---
-        # Normalement : appel à Jupiter API -> route -> signature -> envoi
-        # Pour ce test, on "faux-signe" une TX et on simule succès
         fake_tx = "FAKE12345TXHASH"
 
         logger.info(f"Fake buy {PROBE_SOL} SOL -> tokenX")
