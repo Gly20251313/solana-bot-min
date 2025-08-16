@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 import os, time, json, base64, math, tempfile, shutil, logging, uuid
 from datetime import datetime
-import requests
-import based58  # ⚠️ pas "base58"
-import pytz
 from typing import Dict, Any, Set
 
+import requests
+import base58            # ✅ utiliser le paquet "base58" (requirements: base58==2.1.1)
+import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# Solana stack (versions stables)
-from solana.keypair import Keypair           # solana==0.25.0
+# Solana stack (versions stables, requirements: solana==0.25.0)
+from solana.keypair import Keypair
 from solana.rpc.api import Client
 from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
@@ -82,9 +82,9 @@ DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"      # + /{
 # Whitelist de protocoles pour routes Jupiter (ajuste si besoin)
 ALLOWED_PROTOCOLS = {"Raydium", "Orca", "Phoenix", "Lifinity"}
 
-# ==========
+# =========
 # Telegram
-# ==========
+# =========
 def send(msg: str):
     if not TOKEN or not CHAT:
         logger.warning("Telegram non configuré")
@@ -152,12 +152,22 @@ def load_keypair() -> Keypair:
     pk_str = os.getenv("SOLANA_PRIVATE_KEY")
     if not pk_str:
         raise ValueError("Variable SOLANA_PRIVATE_KEY manquante")
-    secret = based58.b58decode(pk_str.strip())
-    if len(secret) != 64:
-        raise ValueError(f"Clé invalide: {len(secret)} octets — attendu 64 (après décodage base58)")
-    kp = Keypair.from_secret_key(secret)
-    logger.info(f"[boot] Public key: {kp.public_key}")
-    return kp
+    pk_str = pk_str.strip()
+    try:
+        # format JSON array (64 octets)
+        if pk_str.startswith("["):
+            arr = json.loads(pk_str)
+            secret = bytes(arr)
+        else:
+            # base58 (64 octets après décodage)
+            secret = base58.b58decode(pk_str)
+        if len(secret) != 64:
+            raise ValueError(f"Clé invalide: {len(secret)} octets — attendu 64 (après décodage)")
+        kp_ = Keypair.from_secret_key(secret)
+        logger.info(f"[boot] Public key: {kp_.public_key}")
+        return kp_
+    except Exception as e:
+        raise ValueError(f"Impossible de charger la clé privée: {e}")
 
 kp = load_keypair()
 client = Client(RPC_URL)
@@ -238,8 +248,6 @@ def load_dynamic_tokens():
 # ===================
 # Whitelist fixe (≈50)
 # ===================
-# ⚠️ Par sécurité, je fournis un noyau dur (solides & bien connus).
-# Tu peux ajouter d’autres mints sûrs ici si tu veux atteindre ~50 fixes.
 FIXED_TOKENS: Set[str] = {
     WSOL,                # WSOL
     USDC,                # USDC
@@ -250,7 +258,7 @@ FIXED_TOKENS: Set[str] = {
     "orcaEGLhXZcJuz2o1qgTt1rYfM8nRAPdY6inZY3khQk",   # ORCA
     "mSoLzysDnAqFLQ9dLru6T3rzEdd3TvTjL2AcK8tq7M2",   # mSOL
     "7dHbWXmci3dT8Q2ZUr9z5r5j6CkhdV8kFVUMbiZyJHcN",  # stSOL
-    # Ajoute ici tes mints fixes supplémentaires si tu veux atteindre ~50
+    # Ajoute ici d’autres mints sûrs pour étoffer jusqu’à ~50 si souhaité
 }
 
 # ==================
@@ -500,7 +508,6 @@ def refresh_dynamic_tokens():
             return
 
         found: Set[str] = set()
-        # Tri par volume 24h desc pour capter les plus liquides
         pairs.sort(key=lambda p: pair_volume_h24_usd(p), reverse=True)
 
         for p in pairs:
@@ -517,7 +524,6 @@ def refresh_dynamic_tokens():
 
             base_mint = (p.get("baseToken") or {}).get("address")
             quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
-            # On prend préférentiellement les paires côté SOL/USDC
             if not base_mint:
                 continue
             if quote_sym not in ("SOL", "WSOL", "USDC"):
@@ -806,7 +812,8 @@ def handle_command(text: str):
                 return
             sig1 = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
             # back
-            q2 = jup_quote(USDC, WSOL, int(float(q.get("outAmount", "0"))*0.98), min(SLIPPAGE_BPS, 50))
+            out_amt = int(float(q.get("outAmount", "0"))*0.98) if q.get("outAmount") else int(lamports*0.98)
+            q2 = jup_quote(USDC, WSOL, out_amt, min(SLIPPAGE_BPS, 50))
             if not q2 or not route_is_whitelisted(q2):
                 send("🔍 TestTrade SELL: route non whitelist ou quote vide")
                 return
