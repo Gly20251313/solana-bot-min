@@ -278,7 +278,7 @@ def get_sol_usd() -> float:
 def fetch_pairs() -> list:
     """Récupère ~30 paires via /search (q=SOL/USDC), puis filtre chainId='solana'."""
     try:
-        r = http_get(DEX_SCREENER_SEARCH, params={"q": "SOL/USDC"}, timeout=20)
+        r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
         data = r.json() or {}
         pairs = data.get("pairs", []) or []
         return [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
