@@ -915,7 +915,7 @@ def daily_summary():
         for m, p in positions.items():
             ep = p.get('entry_price_sol') or 0.0
             pk = p.get('peak_price_sol') or 0.0
-            lines.append("- "+p['symbol']+" ["+p.get('score','?')+"] | entry "+f\"{ep:.6f}\"+" SOL | peak "+f\"{pk:.6f}\"+" SOL")
+            lines.append(f"- {p['symbol']} [{p.get('score','?')}] | entry {ep:.6f} SOL | peak {pk:.6f} SOL")
         body = "\n".join(lines)
     else:
         body = "Aucune position ouverte."
