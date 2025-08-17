@@ -46,7 +46,7 @@ MAX_SLIPPAGE_BPS         = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
 MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 
-PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1"
+PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1")
 PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.005"))
 PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
 PROBE_SELL_FACTOR        = float(os.getenv("PROBE_SELL_FACTOR", "0.95"))
@@ -915,7 +915,7 @@ def daily_summary():
         for m, p in positions.items():
             ep = p.get('entry_price_sol') or 0.0
             pk = p.get('peak_price_sol') or 0.0
-            lines.append(f"- {p['symbol']} [{p.get('score','?')}] | entry {ep:.6f} SOL | peak {pk:.6f} SOL")
+            lines.append("- "+p['symbol']+" ["+p.get('score','?')+"] | entry "+f\"{ep:.6f}\"+" SOL | peak "+f\"{pk:.6f}\"+" SOL")
         body = "\n".join(lines)
     else:
         body = "Aucune position ouverte."
@@ -967,7 +967,7 @@ def handle_command(text: str, chat_id: str = None):
                 if not q or not ok_route:
                     send("Route non whitelistée pour /forcebuy | labels="+", ".join([l for l in labels if l])); return
                 sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
-                send(f"🚨 FORCE BUY {sym} ({mint})\nMontant: {size_sol:.4f} SOL\nTx: {sig}")
+                send("🚨 FORCE BUY "+sym+" ("+mint+")\nMontant: "+f\"{size_sol:.4f}\"+" SOL\nTx: "+str(sig))
             else:
                 send("Sonde anti-honeypot KO — /forcebuy annulé.")
         except Exception as e:
