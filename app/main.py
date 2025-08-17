@@ -760,11 +760,13 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         if not q or not route_is_whitelisted(q):
             send(f"⛔ Route non whitelist pour {base_sym} — rejet"); return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send(f"📈 Achat {base_sym} [{score}]
+        send(
+        f"""📈 Achat {base_sym} [{score}]
 Montant: {size_sol:.4f} SOL
 Pair: {pair_url}
 ID: {trade_id}
-Tx: {sig}")
+Tx: {sig}"""
+        )
     except Exception as e:
         send(f"❌ Achat {base_sym} échoué: {e}"); return
     price_sol = pair_price_in_sol(pair, sol_usd)
