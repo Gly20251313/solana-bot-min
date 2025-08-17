@@ -49,6 +49,7 @@ DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1"
 
 FINAL_WL_MODE = os.getenv("FINAL_WL_MODE", "on").lower() in ("on", "true", "1")
+WHITELIST_MODE = os.getenv("WHITELIST_MODE", os.getenv("WL_MODE","strict")).lower()
 DEBUG_PROBE   = os.getenv("DEBUG_PROBE", "0") == "1"
 PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.005"))
 PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
@@ -430,7 +431,7 @@ def _build_allowed_patterns():
     return pats
 _ALLOWED_PATTERNS = _build_allowed_patterns()
 
-def route_is_whitelisted(quote: dict, return_labels: bool=False):
+def (route_is_whitelisted(quote: dict, return_labels: bool=False) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive'):
     rp = quote.get("routePlan") or quote.get("marketInfos") or []
     labels = []
     if not isinstance(rp, list):
@@ -601,14 +602,14 @@ def probe_trade(mint: str, user_pubkey: str):
         q_buy  = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
         if not q_buy:
             logger.info("🧪 probe BUY: quote vide"); send("🧪 probe BUY: quote vide"); return None
-        ok_buy, buy_labels = route_is_whitelisted(q_buy, return_labels=True)
+        ok_buy, buy_labels = (route_is_whitelisted(q_buy, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
         logger.info(f"🧪 probe BUY route labels={buy_labels} ok={ok_buy}")
         if not ok_buy: return None
 
         q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
         if not q_sell:
             logger.info("🧪 probe SELL: quote vide"); send("🧪 probe SELL: quote vide"); return None
-        ok_sell, sell_labels = route_is_whitelisted(q_sell, return_labels=True)
+        ok_sell, sell_labels = (route_is_whitelisted(q_sell, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
         logger.info(f"🧪 probe SELL route labels={sell_labels} ok={ok_sell}")
         if not ok_sell: return None
 
@@ -723,6 +724,22 @@ def final_whitelist() -> Set[str]:
     }
     return set(fixed) | set(DYNAMIC_TOKENS)
 
+def wl_final_allows(mint: str) -> bool:
+    """Final whitelist gate:
+    - If FINAL_WL_MODE==False -> always allow (we rely on other filters + probe)
+    - Else require membership in final_whitelist().
+    """
+    try:
+        if not FINAL_WL_MODE:
+            return True
+        wl = final_whitelist()  # kept for info
+    _wl_final_allows = wl_final_allows
+        return mint in wl
+    except Exception:
+        # If anything goes wrong, be conservative if mode is on; permissive if off
+        return (not FINAL_WL_MODE)
+
+
 # ======================
 # Trading
 # ======================
@@ -731,7 +748,8 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     base_mint = (pair.get("baseToken") or {}).get("address")
     base_sym  = (pair.get("baseToken") or {}).get("symbol") or "TOKEN"
     pair_url  = pair.get("url") or "https://dexscreener.com/solana"
-    wl = final_whitelist()
+    wl = final_whitelist()  # kept for info
+    _wl_final_allows = wl_final_allows
     if not base_mint or base_mint in positions or base_mint not in wl or is_blacklisted(base_mint): return
     balance = get_balance_sol()
     size_sol = size_for_score(balance, score)
@@ -749,7 +767,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
 
     try:
         q = jup_quote(WSOL, base_mint, lamports, SLIPPAGE_BPS)
-        ok_route, labels = route_is_whitelisted(q, return_labels=True)
+        ok_route, labels = (route_is_whitelisted(q, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
         if not q or not ok_route:
             send("⛔ Route non whitelist pour "+base_sym+" — labels="+", ".join([l for l in labels if l])+" — rejet"); return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
@@ -770,7 +788,7 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         if bal_amount <= 0:
             send(reason+" "+symbol+": aucun solde token détecté (déjà vendu ?)"); return True
         q = jup_quote(mint, WSOL, int(bal_amount * 0.99), SLIPPAGE_BPS)
-        ok_route, labels = route_is_whitelisted(q, return_labels=True)
+        ok_route, labels = (route_is_whitelisted(q, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
         if not q or not ok_route:
             send("⛔ Route non whitelist à la vente pour "+symbol+" — labels="+", ".join([l for l in labels if l])+" — tentative annulée"); return False
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
@@ -818,7 +836,8 @@ def scan_market():
         pairs = fetch_pairs()
         if not pairs: return
         pairs = rank_candidates(pairs, sol_usd)
-        wl = final_whitelist()
+        wl = final_whitelist()  # kept for info
+    _wl_final_allows = wl_final_allows
         candidates = []
         debug_sent = 0
 
@@ -826,9 +845,9 @@ def scan_market():
             base_mint = (p.get("baseToken") or {}).get("address")
             base_sym  = (p.get("baseToken") or {}).get("symbol") or "?"
             if not base_mint: continue
-            if base_mint not in wl:
+            if (not base_mint) or (not wl_final_allows(base_mint)):
                 if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
-                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale"; logger.info(msg); send(msg); debug_sent += 1
+                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale (FINAL_WL_MODE=on)"; logger.info(msg); send(msg); debug_sent += 1
                 continue
 
             liq_usd = pair_liquidity_usd(p)
@@ -940,11 +959,11 @@ def handle_command(text: str, chat_id: str = None):
         try:
             amt = max(0.002, PROBE_SOL); lamports = int(amt * 1_000_000_000)
             q = jup_quote(WSOL, USDC, lamports, min(SLIPPAGE_BPS, 50))
-            ok_route, labels = route_is_whitelisted(q, return_labels=True)
+            ok_route, labels = (route_is_whitelisted(q, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
             if not q or not ok_route: send("🔍 TestTrade: route non whitelist | labels="+", ".join([l for l in labels if l])); return
             sig1 = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
             q2 = jup_quote(USDC, WSOL, int(float(q.get("outAmount","0"))*0.98), min(SLIPPAGE_BPS, 50))
-            ok_route2, labels2 = route_is_whitelisted(q2, return_labels=True)
+            ok_route2, labels2 = (route_is_whitelisted(q2, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
             if not q2 or not ok_route2: send("🔍 TestTrade SELL: route non whitelist | labels="+", ".join([l for l in labels2 if l])); return
             sig2 = sign_and_send(jup_swap_tx(q2, str(kp.public_key), use_dynamic=True))
             send("✅ TestTrade OK\nBuy Tx: "+str(sig1)+"\nSell Tx: "+str(sig2))
@@ -966,7 +985,7 @@ def handle_command(text: str, chat_id: str = None):
             if not PROBE_ENABLED or probe_trade(mint, str(kp.public_key)):
                 lamports = int(size_sol * 1_000_000_000)
                 q = jup_quote(WSOL, mint, lamports, SLIPPAGE_BPS)
-                ok_route, labels = route_is_whitelisted(q, return_labels=True)
+                ok_route, labels = (route_is_whitelisted(q, return_labels=True) or WHITELIST_MODE=='off' or WHITELIST_MODE=='permissive')
                 if not q or not ok_route:
                     send("Route non whitelistée pour /forcebuy | labels="+", ".join([l for l in labels if l])); return
                 sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
@@ -1050,10 +1069,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-def wl_final_allows(mint: str) -> bool:
-    # si FINAL_WL_MODE=off → on n’exige pas la présence dans la whitelist finale
-    if not FINAL_WL_MODE:
-        return True
-    return mint in final_whitelist()
