@@ -342,7 +342,6 @@ def _candidate_score(p: dict, sol_usd: float) -> float:
 def rank_candidates(pairs: list, sol_usd: float) -> list:
     return sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
 
-def _build_allowed_patterns():
     pats = set()
     for p in ALLOWED_PROTOCOLS:
         s = p.lower().strip()
@@ -356,7 +355,43 @@ def _build_allowed_patterns():
 
 _ALLOWED_PATTERNS = _build_allowed_patterns()
 
+
+def _build_allowed_patterns():
+    pats = set()
+    for p in ALLOWED_PROTOCOLS:
+        s = str(p).lower().strip()
+        if not s:
+            continue
+        pats.add(s)
+        if s == "orca":
+            pats.update(["whirlpool"])
+        if s == "raydium":
+            pats.update(["raydium clmm", "raydium cpmm"])
+        if s in ("openbook", "serum"):
+            pats.update(["openbook", "serum"])
+        if s == "meteora":
+            pats.update(["meteora", "dlmm"])
+        if s == "pump.fun":
+            pats.update(["pump.fun", "amm"])
+    return pats
+
+_ALLOWED_PATTERNS = _build_allowed_patterns()
+
 def route_is_whitelisted(quote: dict, return_labels: bool = False):
+    rp = quote.get("routePlan") or quote.get("marketInfos") or []
+    labels = []
+    if not isinstance(rp, list):
+        return (False, labels) if return_labels else False
+    for step in rp:
+        info = step.get("swapInfo") or step
+        label = (info.get("label") or info.get("protocol") or "").strip()
+        labels.append(label)
+        lbl = label.lower()
+        # tolérance: "contains" sur les libellés connus
+        if not any(pat in lbl for pat in _ALLOWED_PATTERNS):
+            return (False, labels) if return_labels else False
+    return (True, labels) if return_labels else True
+
     rp = quote.get("routePlan") or quote.get("marketInfos") or []
     labels = []
     if not isinstance(rp, list):
@@ -493,26 +528,27 @@ def blacklist(mint: str, hours=24):
     BLACKLIST[mint] = time.time() + hours*3600
     save_blacklist()
 
-def probe_trade(mint: str, user_pubkey: str) -> Optional[bool]:
-    """Return True (OK), False (hard fail → blacklist), None (soft fail → skip)."""
-    if not PROBE_ENABLED: return True
+
+def probe_trade(mint: str, user_pubkey: str):
+    """Retourne True (ok), False (échec dur), ou None (soft-skip: route non whitelist, quote vide, DRY_RUN)."""
+    if not PROBE_ENABLED:
+        return True
     try:
         lamports = max(1, int(PROBE_SOL * 1_000_000_000))
-        q_buy  = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
-        q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
-
+        # BUY
+        q_buy = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
         if not q_buy:
-            send("🧪 probe: BUY quote vide"); return False
-        ok_buy, labels_buy = route_is_whitelisted(q_buy, return_labels=True)
+            send("🧪 probe: BUY quote vide"); return None
+        ok_buy = route_is_whitelisted(q_buy)
         if not ok_buy:
-            send("🧪 probe: BUY non whitelist → " + ", ".join(labels_buy)); return None
-
+            send("🧪 probe: BUY route non whitelistée"); return None
+        # SELL
+        q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
         if not q_sell:
-            send("🧪 probe: SELL quote vide"); return False
-        ok_sell, labels_sell = route_is_whitelisted(q_sell, return_labels=True)
+            send("🧪 probe: SELL quote vide"); return None
+        ok_sell = route_is_whitelisted(q_sell)
         if not ok_sell:
-            send("🧪 probe: SELL non whitelist → " + ", ".join(labels_sell)); return None
-
+            send("🧪 probe: SELL route non whitelistée"); return None
         if DRY_RUN:
             return True
         _ = sign_and_send(jup_swap_tx(q_buy, user_pubkey))
@@ -522,25 +558,6 @@ def probe_trade(mint: str, user_pubkey: str) -> Optional[bool]:
         logger.warning("probe_trade: " + str(e))
         return False
 
-def score_pair(chg_pct: float, liq_usd: float, vol_usd: float, age_sec: float, min_liq_usd: float, min_vol_usd: float) -> str:
-    if chg_pct < ENTRY_THRESHOLD * 100:  # %
-        return "B"
-    hard = (liq_usd >= min_liq_usd) and (vol_usd >= min_vol_usd) and (age_sec >= MIN_POOL_AGE_SEC)
-    if hard: return "A+"
-    soft = (liq_usd >= 0.9*min_liq_usd) and (vol_us_usd := vol_usd) >= min_vol_usd and (age_sec >= 0.5*MIN_POOL_AGE_SEC)
-    return "A" if soft else "B"
-
-def size_for_score(balance_sol: float, score: str) -> float:
-    if score == "A+":
-        pct = POSITION_SIZE_PCT
-    elif score == "A" and ALLOW_A_TRADES:
-        pct = float(A_SIZE_PCT_ENV)
-    else:
-        return 0.0
-    size_sol = max(balance_sol * pct, MIN_TRADE_SOL)
-    return min(size_sol, balance_sol * 0.99)
-
-def refresh_dynamic_tokens():
     global DYNAMIC_TOKENS
     try:
         sol_usd = get_sol_usd()
