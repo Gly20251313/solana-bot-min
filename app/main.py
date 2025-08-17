@@ -566,19 +566,25 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     lamports = int(size_sol * 1_000_000_000)
     if lamports <= 0:
         send("❌ Achat annulé: solde SOL insuffisant"); return
-    trade_id = new_trade_id()
+     trade_id = new_trade_id()
     _probe = probe_trade(base_mint, str(kp.public_key))
-        if _probe is False:
-            blacklist(base_mint, hours=24); send('🧪 Sonde KO → blacklist 24h : ' + base_mint); return
-        elif _probe is not True:
-            return
-    try:
-    probe_res = probe_trade(base_mint, str(kp.public_key))
-        if probe_res is False:
-            blacklist(base_mint, hours=24); send("🧪 Sonde KO → blacklist 24h : " + base_mint); return
-        elif probe_res is None:
-            send("🧪 Sonde: route non whitelist → skip (pas de blacklist)"); return
+    if _probe is False:
+        blacklist(base_mint, hours=24)
+        send("🧪 Sonde KO → blacklist 24h : " + base_mint)
+        return
+    elif _probe is not True:
+        return
 
+    try:
+        probe_res = probe_trade(base_mint, str(kp.public_key))
+        if probe_res is False:
+            blacklist(base_mint, hours=24)
+            send("🧪 Sonde KO → blacklist 24h : " + base_mint)
+            return
+        elif probe_res is None:
+            send("🧪 Sonde: route non whitelist → skip (pas de blacklist)")
+            return
+            
         q = jup_quote(WSOL, base_mint, lamports, SLIPPAGE_BPS)
         ok_route, labels = route_is_whitelisted(q, return_labels=True)
         if not q or not ok_route:
