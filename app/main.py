@@ -347,11 +347,14 @@ def get_sol_usd() -> float:
         return 150.0
 
 def fetch_pairs() -> list:
-    """Récupère des paires Solana en agrégeant plusieurs requêtes de recherche et un fallback 'boosts'."""
+    """Récupère des paires Solana en agrégeant plusieurs requêtes de recherche et un fallback via token boosts.
+    - Search: plusieurs queries (quotes + mots-clés) ⇒ ~30 résultats chacune
+    - Boosts: on récupère des tokenAddress récents/populaires, puis on batch sur /tokens/v1/solana/{addr1,...}
+    """
     results = []
     seen = set()
-    # 1) Agrégation par requêtes de recherche (limitées à ~30 chacune)
-    queries = list(sorted(ALLOWED_QUOTES)) + ["SOLANA", "RAYDIUM", "ORCA"]
+    # 1) Agrégation par requêtes de recherche (limitées côté API)
+    queries = sorted(set(list(ALLOWED_QUOTES) + ["SOLANA", "RAYDIUM", "ORCA", "BONK"]))
     for q in queries:
         try:
             r = http_get(DEX_SCREENER_SEARCH, params={"q": q}, timeout=15)
@@ -379,10 +382,28 @@ def fetch_pairs() -> list:
                 rr = http_get(f"https://api.dexscreener.com/tokens/v1/solana/{batch}", timeout=15)
                 arr = rr.json() or []
                 for info in arr:
-                    if (info.get("chainId") or "").lower() != "solana":
+                    if not isinstance(info, dict):
                         continue
-                    pid = info.get("pairAddress") or ((info.get("baseToken") or {}).get("add
-def get_price_change_pct(pair: dict, window: str) -> float:
+                    pairs = info.get("pairs")
+                    if isinstance(pairs, list) and pairs:
+                        for p in pairs:
+                            if (p.get("chainId") or "").lower() != "solana":
+                                continue
+                            pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
+                            if not pid or pid in seen:
+                                continue
+                            seen.add(pid)
+                            results.append(p)
+                    else:
+                        p = info
+                        if (p.get("chainId") or "").lower() != "solana":
+                            continue
+                        pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
+                        if not pid or pid in seen:
+                            continue
+                        seen.add(pid)
+                        results.append(p)
+            exdef get_price_change_pct(pair: dict, window: str) -> float:
     pc = pair.get("priceChange", {})
     val = pc.get(window)
     try:
@@ -1008,35 +1029,3 @@ def boot_message():
 # =====================
 
 def main():
-    load_positions()
-    load_blacklist()
-    load_dynamic_tokens()
-    load_token_map()
-
-    boot_message()
-    refresh_token_map()
-    refresh_dynamic_tokens()
-    send_boot_diagnostics()
-
-    scheduler = BackgroundScheduler(timezone=TZ)
-    scheduler.add_job(scan_market, "interval", seconds=SCAN_INTERVAL_SEC, id="scan")
-    scheduler.add_job(heartbeat, "interval", minutes=HEARTBEAT_MINUTES, id="heartbeat")
-    scheduler.add_job(daily_summary, "cron", hour=21, minute=0, id="daily_summary")
-    scheduler.add_job(poll_telegram, "interval", seconds=15, id="tg_poll")
-    scheduler.add_job(refresh_dynamic_tokens, "interval", minutes=10, id="dyn_refresh")
-    scheduler.add_job(refresh_token_map, "interval", minutes=30, id="map_refresh")
-    scheduler.start()
-
-    running = True
-    import signal
-    def _stop(*_):
-        nonlocal running; running = False
-    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
-
-    try:
-        while running:
-            time.sleep(1)
-    finally:
-        scheduler.shutdown(); print("[exit] bye")
-
-if __name__ == "__main__":
