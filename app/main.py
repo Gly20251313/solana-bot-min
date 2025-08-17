@@ -46,7 +46,7 @@ MAX_SLIPPAGE_BPS         = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
 MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 
-PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1")
+PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1"
 PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.005"))
 PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
 PROBE_SELL_FACTOR        = float(os.getenv("PROBE_SELL_FACTOR", "0.95"))
