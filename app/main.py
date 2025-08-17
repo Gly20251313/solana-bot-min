@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-import os
-import time
-import json
-import base64
-import math
-import uuid
-import re
-import logging
+"""
+Bot Solana — version 'full logs détaillés'
+- Journaux verbeux à chaque étape (fetch, ranking, dyn whitelist, scan, probe, buy/sell)
+- Whitelist de routes élargie + modes 'strict' / 'permissive'
+- Gestion des erreurs Jupiter (slippage/exactOut) avec retry et dynamic slippage
+- Seuils en USD (MIN_LIQ_USD) + fallback en SOL
+- Télégram + battement + récap quotidien
+"""
+import os, sys, time, json, base64, math, uuid, re, logging
 from typing import Dict, Any, Set, Tuple, List
 from datetime import datetime
 
@@ -23,38 +24,38 @@ from solana.rpc.types import TxOpts
 # ======================
 # Version & ENV
 # ======================
-BOT_VERSION = os.getenv("BOT_VERSION", "v2.1-dynslip-2025-08-17")
+BOT_VERSION = os.getenv("BOT_VERSION", "v2.3-full-logs-2025-08-17")
 
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
 TZ_NAME = os.getenv("TZ", "Europe/Paris")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
-ENTRY_THRESHOLD          = float(os.getenv("ENTRY_THRESHOLD", "0.02"))
+ENTRY_THRESHOLD          = float(os.getenv("ENTRY_THRESHOLD", "0.02"))  # 2% par défaut
 PRICE_WINDOW             = os.getenv("PRICE_WINDOW", "m5")
 POSITION_SIZE_PCT        = float(os.getenv("POSITION_SIZE_PCT", "0.25"))
 A_SIZE_PCT_ENV           = os.getenv("A_SIZE_PCT", "0.15")
 STOP_LOSS_PCT            = float(os.getenv("STOP_LOSS_PCT", "0.10"))
 TRAILING_TRIGGER_PCT     = float(os.getenv("TRAILING_TRIGGER_PCT", "0.30"))
 TRAILING_THROWBACK_PCT   = float(os.getenv("TRAILING_THROWBACK_PCT", "0.20"))
-MAX_OPEN_TRADES          = int(os.getenv("MAX_OPEN_TRADES", "4"))
+MAX_OPEN_TRADES          = int(os.getenv("MAX_OPEN_TRADES", "2"))
 
 SCAN_INTERVAL_SEC        = int(os.getenv("SCAN_INTERVAL_SEC", "30"))
 SLIPPAGE_BPS             = int(os.getenv("SLIPPAGE_BPS", "100"))
-MAX_SLIPPAGE_BPS         = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))  # un peu plus large pour retry
+MAX_SLIPPAGE_BPS         = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
 MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 
-PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1"
+PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1")
 PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.005"))
 PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
 PROBE_SELL_FACTOR        = float(os.getenv("PROBE_SELL_FACTOR", "0.95"))
 
-# New: USD-based liquidity threshold (takes precedence if >0)
-MIN_LIQ_USD              = float(os.getenv("MIN_LIQ_USD", "20000"))  # élargi comme demandé
-MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "1.0"))     # used only if MIN_LIQ_USD<=0
+# Seuils marché
+MIN_LIQ_USD              = float(os.getenv("MIN_LIQ_USD", "20000"))  # seuil USD
+MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "1.0"))    # fallback si MIN_LIQ_USD<=0
 MIN_VOL_SOL              = float(os.getenv("MIN_VOL_SOL", "0.5"))
-MIN_POOL_AGE_SEC         = int(os.getenv("MIN_POOL_AGE_SEC", "600"))  # recommandé ≥ 600 pour éviter les brand new
+MIN_POOL_AGE_SEC         = int(os.getenv("MIN_POOL_AGE_SEC", "600"))
 DYNAMIC_MAX_TOKENS       = int(os.getenv("DYNAMIC_MAX_TOKENS", "200"))
 DYN_IGNORE_FILTERS       = os.getenv("DYN_IGNORE_FILTERS", "0") == "1"
 MAX_PER_QUOTE            = int(os.getenv("MAX_PER_QUOTE", "12"))
@@ -68,10 +69,16 @@ DYN_CACHE_PATH           = os.getenv("DYN_CACHE_PATH", "./dynamic_tokens.json")
 TOKENMAP_CACHE_PATH      = os.getenv("TOKENMAP_CACHE_PATH", "./token_map.json")
 TG_OFFSET_PATH           = os.getenv("TELEGRAM_OFFSET_PATH", "./tg_offset.json")
 
-WHITELIST_MODE           = os.getenv("WHITELIST_MODE", "permissive").strip().lower()  # "strict" or "permissive"
+WHITELIST_MODE           = os.getenv("WHITELIST_MODE", "permissive").strip().lower()  # "strict"|"permissive"
 DATA_SOURCE              = os.getenv("DATA_SOURCE", "").upper()  # "", "GECKO"
 
+# Logs détaillés
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_SAMPLE_LIMIT = int(os.getenv("LOG_SAMPLE_LIMIT", "5"))
+DEBUG_REJECTIONS = os.getenv("DEBUG_REJECTIONS", "1") == "1"
+ROUTE_LOG_LIMIT  = int(os.getenv("ROUTE_LOG_LIMIT", "4"))
+MAX_DEBUG_SENDS_PER_SCAN = int(os.getenv("MAX_DEBUG_SENDS_PER_SCAN", "6"))
+
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("bot")
 
@@ -90,7 +97,7 @@ DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
 DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"  # /{mint}
 
 GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2")
-GECKO_PAGES = int(os.getenv("GECKO_PAGES", "5"))
+GECKO_PAGES = int(os.getenv("GECKO_PAGES", "7"))
 
 ALLOWED_QUOTES: Set[str] = {
     q.strip().upper() for q in os.getenv(
@@ -98,17 +105,37 @@ ALLOWED_QUOTES: Set[str] = {
         "SOL,WSOL,USDC,USDT,BONK,JITOSOL,MSOL"
     ).split(",") if q.strip()
 }
-ALLOWED_PROTOCOLS = {"Raydium", "Orca", "Phoenix", "OpenBook", "Serum", "Meteora", "Lifinity"}
-EXTRA_PROTOCOLS = os.getenv(
-    "ALLOWED_PROTOCOLS_EXTRA",
-    "Whirlpool,CLMM,CPMM,DLMM,Pump.fun,OpenBook,Serum,Meteora,Lifinity,Phoenix,GooseFX,Crema,Invariant,Saros,Step,Raydium AMM"
-)
+ALLOWED_PROTOCOLS = {
+    "Raydium","Orca","Phoenix","OpenBook","Serum","Meteora","Lifinity",
+    "Whirlpool","CLMM","CPMM","DLMM","Pump.fun",
+    "GooseFX","Crema","Invariant","Saros","Step","Raydium AMM"
+}
+EXTRA_PROTOCOLS = os.getenv("ALLOWED_PROTOCOLS_EXTRA", "")
 if EXTRA_PROTOCOLS:
     ALLOWED_PROTOCOLS |= {p.strip() for p in EXTRA_PROTOCOLS.split(",") if p.strip()}
 
 # ======================
-# Telegram helpers
+# Telegram
 # ======================
+def send(msg: str):
+    if not TOKEN or not CHAT:
+        logger.warning("Telegram non configuré")
+        return
+    try:
+        requests.get("https://api.telegram.org/bot"+TOKEN+"/sendMessage",
+                     params={"chat_id": CHAT, "text": msg}, timeout=10)
+    except Exception as e:
+        logger.error("telegram error: "+str(e))
+
+def send_to(chat_id: str, msg: str):
+    if not TOKEN:
+        return
+    try:
+        requests.get("https://api.telegram.org/bot"+TOKEN+"/sendMessage",
+                     params={"chat_id": chat_id, "text": msg}, timeout=10)
+    except Exception as e:
+        logger.error("telegram send_to error: "+str(e))
+
 def _load_tg_offset() -> int:
     try:
         if os.path.exists(TG_OFFSET_PATH):
@@ -122,31 +149,6 @@ def _save_tg_offset(offset: int):
         json.dump({"offset": offset}, open(TG_OFFSET_PATH, "w"))
     except Exception:
         pass
-
-def send(msg: str):
-    if not TOKEN or not CHAT:
-        logger.warning("Telegram non configuré")
-        return
-    try:
-        requests.get(
-            "https://api.telegram.org/bot" + TOKEN + "/sendMessage",
-            params={"chat_id": CHAT, "text": msg},
-            timeout=10
-        )
-    except Exception as e:
-        logger.error("telegram error: " + str(e))
-
-def send_to(chat_id: str, msg: str):
-    if not TOKEN:
-        return
-    try:
-        requests.get(
-            "https://api.telegram.org/bot" + TOKEN + "/sendMessage",
-            params={"chat_id": chat_id, "text": msg},
-            timeout=10
-        )
-    except Exception as e:
-        logger.error("telegram send_to error: " + str(e))
 
 # ======================
 # HTTP helpers
@@ -162,7 +164,7 @@ def http_post(url, json_payload=None, timeout=25):
     return r
 
 # ======================
-# Keypair & RPC client
+# Keypair & RPC
 # ======================
 def load_keypair() -> Keypair:
     pk_str = os.getenv("SOLANA_PRIVATE_KEY", "") or os.getenv("SOL_PRIVATE_KEY", "")
@@ -177,8 +179,8 @@ def load_keypair() -> Keypair:
     elif len(secret) == 32:
         kp = Keypair.from_seed(secret)
     else:
-        raise ValueError("Clé invalide (" + str(len(secret)) + " bytes)")
-    logger.info("[boot] Public key: " + str(kp.public_key))
+        raise ValueError("Clé invalide ("+str(len(secret))+" bytes)")
+    logger.info("[boot] Public key: "+str(kp.public_key))
     return kp
 
 kp = load_keypair()
@@ -186,7 +188,7 @@ client = Client(RPC_URL)
 TZ = pytz.timezone(TZ_NAME)
 
 # ======================
-# Persisted state
+# State
 # ======================
 positions: Dict[str, Dict[str, Any]] = {}
 BLACKLIST: Dict[str, float] = {}
@@ -201,43 +203,36 @@ def now_str():
 def atomic_write_json(path: str, data: dict):
     d = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(d, exist_ok=True)
-    tmp = os.path.join(d, ".tmp_" + uuid.uuid4().hex + ".json")
+    tmp = os.path.join(d, ".tmp_"+uuid.uuid4().hex+".json")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-def save_positions():
-    atomic_write_json(POSITIONS_PATH, {"updated_at": now_str(), "positions": positions})
+def save_positions(): atomic_write_json(POSITIONS_PATH, {"updated_at": now_str(), "positions": positions})
+def save_blacklist(): atomic_write_json(BLACKLIST_PATH, {"updated_at": now_str(), "blacklist": BLACKLIST})
+def save_dynamic_tokens(): atomic_write_json(DYN_CACHE_PATH, {"updated_at": now_str(), "tokens": list(DYNAMIC_TOKENS)})
+def save_token_map(): atomic_write_json(TOKENMAP_CACHE_PATH, {"updated_at": now_str(), "map": TOKEN_MAP})
 
 def load_positions():
     global positions
     if os.path.exists(POSITIONS_PATH):
         data = json.load(open(POSITIONS_PATH, encoding="utf-8")) or {}
         positions = data.get("positions") or {}
-        logger.info("[boot] positions restaurées: " + str(len(positions)))
-
-def save_blacklist():
-    atomic_write_json(BLACKLIST_PATH, {"updated_at": now_str(), "blacklist": BLACKLIST})
+        logger.info("[boot] positions restaurées: "+str(len(positions)))
 
 def load_blacklist():
     global BLACKLIST
     if os.path.exists(BLACKLIST_PATH):
         BL = json.load(open(BLACKLIST_PATH, encoding="utf-8")) or {}
         BLACKLIST = BL.get("blacklist", {}) or {}
-        logger.info("[boot] blacklist restaurée: " + str(len(BLACKLIST)))
-
-def save_dynamic_tokens():
-    atomic_write_json(DYN_CACHE_PATH, {"updated_at": now_str(), "tokens": list(DYNAMIC_TOKENS)})
+        logger.info("[boot] blacklist restaurée: "+str(len(BLACKLIST)))
 
 def load_dynamic_tokens():
     global DYNAMIC_TOKENS
     if os.path.exists(DYN_CACHE_PATH):
         data = json.load(open(DYN_CACHE_PATH, encoding="utf-8")) or {}
         DYNAMIC_TOKENS = set(data.get("tokens") or [])
-        logger.info("[boot] dynamic tokens restaurés: " + str(len(DYNAMIC_TOKENS)))
-
-def save_token_map():
-    atomic_write_json(TOKENMAP_CACHE_PATH, {"updated_at": now_str(), "map": TOKEN_MAP})
+        logger.info("[boot] dynamic tokens restaurés: "+str(len(DYNAMIC_TOKENS)))
 
 def load_token_map():
     global TOKEN_MAP, SYMBOL_TO_MINT
@@ -245,7 +240,7 @@ def load_token_map():
         data = json.load(open(TOKENMAP_CACHE_PATH, encoding="utf-8")) or {}
         TOKEN_MAP = data.get("map") or {}
         SYMBOL_TO_MINT = {(v.get("symbol") or "").upper(): m for m, v in TOKEN_MAP.items() if v}
-        logger.info("[boot] token map restaurée: " + str(len(TOKEN_MAP)))
+        logger.info("[boot] token map restaurée: "+str(len(TOKEN_MAP)))
 
 # ======================
 # Price & APIs
@@ -260,7 +255,7 @@ def get_sol_usd() -> float:
         price = float((entry or {}).get("usdPrice"))
         return price
     except Exception as e:
-        logger.warning("prix SOL fallback 150 USD (" + str(e) + ")")
+        logger.warning("prix SOL fallback 150 USD ("+str(e)+")")
         return 150.0
 
 def gecko_get(path, params=None, timeout=10):
@@ -281,7 +276,7 @@ def gecko_pairs_from_page(data) -> List[dict]:
         out.append({
             "chainId": "solana",
             "pairAddress": it.get("id"),
-            "url": "https://www.geckoterminal.com/solana/pools/" + str(it.get("id")),
+            "url": "https://www.geckoterminal.com/solana/pools/"+str(it.get("id")),
             "baseToken":  {"address": base.get("address"),  "symbol": (base.get("symbol") or "").upper()},
             "quoteToken": {"address": quote.get("address"), "symbol": (quote.get("symbol") or "").upper()},
             "liquidity": {"usd": float(attr.get("reserve_in_usd") or 0)},
@@ -297,113 +292,103 @@ def gecko_pairs_from_page(data) -> List[dict]:
     return out
 
 def fetch_pairs() -> list:
-    # If env forces Gecko, use it (trending + new pools). Else try DexScreener search then Gecko fallback.
+    """DexScreener (search=solana) → Gecko fallback; GECKO mode force Gecko trending+new."""
+    t0 = time.time()
     if DATA_SOURCE == "GECKO":
         results, seen = [], set()
-        # trending 1..GECKO_PAGES
         for p in range(1, max(1, GECKO_PAGES) + 1):
             try:
                 d = gecko_get("/networks/solana/trending_pools",
                               {"page": p, "include": "base_token,quote_token"})
-                for pair in gecko_pairs_from_page(d):
+                page_pairs = gecko_pairs_from_page(d)
+                for pair in page_pairs:
                     pid = pair.get("pairAddress")
                     if pid and pid not in seen:
                         seen.add(pid); results.append(pair)
             except Exception as e:
-                logger.debug("gecko trending page " + str(p) + " failed: " + str(e))
-        # new pools 1..min(2, pages)
+                logger.debug(f"[fetch] gecko trending p{p} fail: {e}")
         for p in range(1, min(2, max(1, GECKO_PAGES)) + 1):
             try:
                 d = gecko_get("/networks/solana/new_pools",
                               {"page": p, "include": "base_token,quote_token"})
-                for pair in gecko_pairs_from_page(d):
+                page_pairs = gecko_pairs_from_page(d)
+                for pair in page_pairs:
                     pid = pair.get("pairAddress")
                     if pid and pid not in seen:
                         seen.add(pid); results.append(pair)
             except Exception as e:
-                logger.debug("gecko new_pools page " + str(p) + " failed: " + str(e))
+                logger.debug(f"[fetch] gecko new_pools p{p} fail: {e}")
+        logger.info(f"[fetch] source=GECKO pairs={len(results)} in {time.time()-t0:.2f}s")
         return results
 
-    # DexScreener search → "solana"
+    # DexScreener
     try:
         r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
         data = r.json() or {}
         pairs = data.get("pairs", []) or []
         out = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
-        if out:
-            return out
+        logger.info(f"[fetch] source=DexScreener pairs={len(out)} in {time.time()-t0:.2f}s")
+        if out: return out
     except Exception as e:
-        logger.debug("DexScreener search fail: " + str(e))
+        logger.debug("[fetch] DexScreener fail: "+str(e))
 
-    # Fallback Gecko
-    try:
-        results, seen = [], set()
-        for p in range(1, max(1, GECKO_PAGES) + 1):
-            try:
-                d = gecko_get("/networks/solana/trending_pools",
-                              {"page": p, "include": "base_token,quote_token"})
-                for pair in gecko_pairs_from_page(d):
-                    pid = pair.get("pairAddress")
-                    if pid and pid not in seen:
-                        seen.add(pid); results.append(pair)
-            except Exception as e:
-                logger.debug("gecko trending page " + str(p) + " failed: " + str(e))
-        for p in range(1, min(2, max(1, GECKO_PAGES)) + 1):
-            try:
-                d = gecko_get("/networks/solana/new_pools",
-                              {"page": p, "include": "base_token,quote_token"})
-                for pair in gecko_pairs_from_page(d):
-                    pid = pair.get("pairAddress")
-                    if pid and pid not in seen:
-                        seen.add(pid); results.append(pair)
-            except Exception as e:
-                logger.debug("gecko new_pools page " + str(p) + " failed: " + str(e))
-        return results
-    except Exception as e:
-        logger.warning("fetch_pairs fallback gecko error: " + str(e))
-        return []
+    # Gecko fallback
+    results, seen = [], set()
+    for p in range(1, max(1, GECKO_PAGES) + 1):
+        try:
+            d = gecko_get("/networks/solana/trending_pools",
+                          {"page": p, "include": "base_token,quote_token"})
+            page_pairs = gecko_pairs_from_page(d)
+            for pair in page_pairs:
+                pid = pair.get("pairAddress")
+                if pid and pid not in seen:
+                    seen.add(pid); results.append(pair)
+        except Exception as e:
+            logger.debug(f"[fetch] gecko trending p{p} fail: {e}")
+    for p in range(1, min(2, max(1, GECKO_PAGES)) + 1):
+        try:
+            d = gecko_get("/networks/solana/new_pools",
+                          {"page": p, "include": "base_token,quote_token"})
+            page_pairs = gecko_pairs_from_page(d)
+            for pair in page_pairs:
+                pid = pair.get("pairAddress")
+                if pid and pid not in seen:
+                    seen.add(pid); results.append(pair)
+        except Exception as e:
+            logger.debug(f"[fetch] gecko new_pools p{p} fail: {e}")
+    logger.info(f"[fetch] source=Gecko-fallback pairs={len(results)} in {time.time()-t0:.2f}s")
+    return results
 
 def get_price_change_pct(pair: dict, window: str) -> float:
     pc = pair.get("priceChange", {})
     val = pc.get(window)
-    try:
-        return float(val)
-    except Exception:
-        return float("nan")
+    try: return float(val)
+    except Exception: return float("nan")
 
-def pair_liquidity_usd(pair: dict) -> float:
-    return float((pair.get("liquidity") or {}).get("usd") or 0.0)
-
-def pair_volume_h24_usd(pair: dict) -> float:
-    return float((pair.get("volume") or {}).get("h24") or 0.0)
+def pair_liquidity_usd(pair: dict) -> float: return float((pair.get("liquidity") or {}).get("usd") or 0.0)
+def pair_volume_h24_usd(pair: dict) -> float: return float((pair.get("volume") or {}).get("h24") or 0.0)
 
 def pair_price_in_sol(pair: dict, sol_usd: float) -> float:
     price_native = pair.get("priceNative")
     quote_sym = (pair.get("quoteToken") or {}).get("symbol", "")
-    if quote_sym and quote_sym.upper() in ("SOL", "WSOL") and price_native:
-        try:
-            return float(price_native)
-        except Exception:
-            pass
+    if quote_sym and quote_sym.upper() in ("SOL","WSOL") and price_native:
+        try: return float(price_native)
+        except Exception: pass
     price_usd = pair.get("priceUsd")
     if price_usd:
-        try:
-            return float(price_usd) / max(sol_usd, 1e-9)
-        except Exception:
-            pass
+        try: return float(price_usd) / max(sol_usd, 1e-9)
+        except Exception: pass
     return float("nan")
 
 def pair_age_sec(pair: dict) -> float:
     ts = pair.get("pairCreatedAt")
     try:
-        if ts:
-            return max(0, (time.time()*1000 - float(ts)) / 1000.0)
-    except Exception:
-        pass
+        if ts: return max(0, (time.time()*1000 - float(ts)) / 1000.0)
+    except Exception: pass
     return 0.0
 
 # ======================
-# Ranking
+# Ranking / Scoring
 # ======================
 def _candidate_score(p: dict, sol_usd: float) -> float:
     ch5 = float(get_price_change_pct(p, "m5") or 0.0)
@@ -415,7 +400,13 @@ def _candidate_score(p: dict, sol_usd: float) -> float:
     return (ch5 * 1.0) + (max(ch1, 0.0) * 0.5) + v_term + liq_term
 
 def rank_candidates(pairs: list, sol_usd: float) -> list:
-    return sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
+    ranked = sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
+    # Log top sample
+    for i, p in enumerate(ranked[:LOG_SAMPLE_LIMIT]):
+        b = (p.get("baseToken") or {}).get("symbol") or "?"
+        q = (p.get("quoteToken") or {}).get("symbol") or "?"
+        logger.info(f"[rank] top{i+1}: {b}/{q} liq=${pair_liquidity_usd(p):.0f} vol24=${pair_volume_h24_usd(p):.0f} m5={get_price_change_pct(p,'m5'):.1f}% url={p.get('url','-')}")
+    return ranked
 
 # ======================
 # Whitelist patterns
@@ -424,28 +415,19 @@ def _build_allowed_patterns():
     pats = set()
     for p in ALLOWED_PROTOCOLS:
         s = str(p).lower().strip()
-        if not s:
-            continue
+        if not s: continue
         pats.add(s)
-        if s == "orca":
-            pats.update(["whirlpool"])
-        if s == "raydium":
-            pats.update(["raydium clmm", "raydium cpmm", "raydium amm"])
-        if s in ("openbook", "serum", "phoenix"):
-            pats.update(["openbook", "serum", "phoenix"])
-        if s == "lifinity":
-            pats.update(["lifinity"])
-        if s == "meteora":
-            pats.update(["meteora", "dlmm"])
-        if s == "pump.fun":
-            pats.update(["pump.fun", "amm"])
-        # divers
-        pats.update(["cpmm", "clmm", "dlmm"])
+        if s == "orca": pats.update(["whirlpool"])
+        if s == "raydium": pats.update(["raydium clmm","raydium cpmm","raydium amm"])
+        if s in ("openbook","serum","phoenix"): pats.update(["openbook","serum","phoenix"])
+        if s == "lifinity": pats.update(["lifinity"])
+        if s == "meteora": pats.update(["meteora","dlmm"])
+        if s == "pump.fun": pats.update(["pump.fun","amm"])
+        pats.update(["cpmm","clmm","dlmm"])
     return pats
-
 _ALLOWED_PATTERNS = _build_allowed_patterns()
 
-def route_is_whitelisted(quote: dict, return_labels: bool = False):
+def route_is_whitelisted(quote: dict, return_labels: bool=False):
     rp = quote.get("routePlan") or quote.get("marketInfos") or []
     labels = []
     if not isinstance(rp, list):
@@ -461,14 +443,11 @@ def route_is_whitelisted(quote: dict, return_labels: bool = False):
     if unknowns and WHITELIST_MODE == "strict":
         return (False, labels) if return_labels else False
     if unknowns and WHITELIST_MODE == "permissive":
-        try:
-            send("⚠️ Protocole(s) tolérés hors whitelist stricte: " + ", ".join([u for u in unknowns if u]))
-        except Exception:
-            pass
+        logger.info("route tolerated (permissive): "+", ".join([u for u in unknowns if u]))
     return (True, labels) if return_labels else True
 
 # ======================
-# Jupiter (quotes & swaps)
+# Jupiter (quote/swap)
 # ======================
 def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippage_bps: int):
     params = {
@@ -482,12 +461,12 @@ def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippa
     r = http_get(JUP_QUOTE_URL, params=params, timeout=15)
     return r.json()
 
-def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True, use_dynamic: bool = True):
+def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool=True, use_dynamic: bool=True):
     payload = {
         "quoteResponse": quote_resp,
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": wrap_unwrap_sol,
-        "asLegacyTransaction": True,  # reste en Legacy (on signe via Transaction.deserialize)
+        "asLegacyTransaction": True,
     }
     if use_dynamic:
         payload["dynamicSlippage"] = {"minBps": 50, "maxBps": MAX_SLIPPAGE_BPS}
@@ -512,7 +491,6 @@ def sign_and_send(serialized_b64: str):
 
 def _is_jup_slippage_err(err: Exception) -> bool:
     s = str(err)
-    # 0x1771=6001 (SlippageToleranceExceeded), 6017 (ExactOutAmountNotMatched), 0x1789=6025 (famille similaire)
     return ("0x1771" in s) or ("6001" in s) or ("6017" in s) or ("0x1789" in s) or ("6025" in s)
 
 # ======================
@@ -524,8 +502,7 @@ def get_balance_sol() -> float:
         lamports = (resp.get("result") or {}).get("value", 0)
         return lamports / 1_000_000_000
     except Exception as e:
-        logger.warning("get_balance_sol error: " + str(e))
-        return 0.0
+        logger.warning("get_balance_sol error: "+str(e)); return 0.0
 
 def get_token_balance(mint: str) -> int:
     try:
@@ -533,14 +510,11 @@ def get_token_balance(mint: str) -> int:
             kp.public_key, {"mint": mint}, commitment="confirmed"
         )
         vals = (resp.get("result") or {}).get("value") or []
-        if not vals:
-            return 0
         total = 0
         for v in vals:
             info = (((v or {}).get("account") or {}).get("data") or {}).get("parsed", {})
             amt = (((info.get("info") or {}).get("tokenAmount")) or {}).get("amount")
-            if amt is not None:
-                total += int(amt)
+            if amt is not None: total += int(amt)
         return total
     except Exception:
         return 0
@@ -548,61 +522,59 @@ def get_token_balance(mint: str) -> int:
 # ======================
 # Utils
 # ======================
-def open_positions_count() -> int:
-    return len(positions)
+def open_positions_count() -> int: return len(positions)
+def can_open_more() -> bool: return open_positions_count() < MAX_OPEN_TRADES
+def new_trade_id() -> str: return uuid.uuid4().hex[:8]
+def ok(b: bool) -> str: return "✅" if b else "❌"
 
-def can_open_more() -> bool:
-    return open_positions_count() < MAX_OPEN_TRADES
+def short_mint(m: str) -> str:
+    return (m[:4]+"…"+m[-4:]) if (m and len(m) > 10) else (m or "?")
 
-def new_trade_id() -> str:
-    return uuid.uuid4().hex[:8]
-
-def ok(b: bool) -> str:
-    return "✅" if b else "❌"
+def log_env_config():
+    send(
+        f"[{BOT_VERSION}] ⚙️ ENV\n"
+        f"WL-mode={WHITELIST_MODE} | DATA_SOURCE={DATA_SOURCE}\n"
+        f"MIN_LIQ_USD={MIN_LIQ_USD} | MIN_LIQ_SOL={MIN_LIQ_SOL} | MIN_VOL_SOL={MIN_VOL_SOL} | AGE≥{MIN_POOL_AGE_SEC}s\n"
+        f"Quotes dyn={','.join(sorted(ALLOWED_QUOTES))}\n"
+        f"Protos={','.join(sorted(ALLOWED_PROTOCOLS))}\n"
+        f"Scan={SCAN_INTERVAL_SEC}s | MaxTrades={MAX_OPEN_TRADES} | DRY_RUN={DRY_RUN}"
+    )
 
 # ==============================
-# Token map & résolution symboles
+# Token map & résolution
 # ==============================
 def refresh_token_map():
     global TOKEN_MAP, SYMBOL_TO_MINT
     try:
         r = http_get(JUP_TOKEN_LIST, timeout=20)
         data = r.json() or []
-        new_map: Dict[str, Dict[str, Any]] = {}
-        sym_map: Dict[str, str] = {}
+        new_map, sym_map = {}, {}
         for t in data:
             mint = t.get("address") or t.get("mint")
             symbol = (t.get("symbol") or "").upper()
-            if not mint or not symbol:
-                continue
+            if not mint or not symbol: continue
             new_map[mint] = {"symbol": symbol, "decimals": t.get("decimals"), "name": t.get("name")}
-            if symbol not in sym_map:
-                sym_map[symbol] = mint
-        TOKEN_MAP = new_map
-        SYMBOL_TO_MINT = sym_map
+            if symbol not in sym_map: sym_map[symbol] = mint
+        TOKEN_MAP = new_map; SYMBOL_TO_MINT = sym_map
         save_token_map()
-        logger.info("[tokenmap] chargé: " + str(len(TOKEN_MAP)) + " mints, " + str(len(SYMBOL_TO_MINT)) + " symboles")
+        logger.info(f"[tokenmap] mints={len(TOKEN_MAP)} symbols={len(SYMBOL_TO_MINT)}")
     except Exception as e:
-        logger.warning("refresh_token_map: " + str(e))
+        logger.warning("refresh_token_map: "+str(e))
 
 def resolve_symbol_or_mint(val: str) -> Tuple[str, str]:
     s = val.strip()
     if MINT_RE.match(s):
-        info = TOKEN_MAP.get(s) or {}
-        return s, (info.get("symbol") or "?")
-    sym = s.upper()
-    mint = SYMBOL_TO_MINT.get(sym)
-    if mint:
-        return mint, sym
+        info = TOKEN_MAP.get(s) or {}; return s, (info.get("symbol") or "?")
+    sym = s.upper(); mint = SYMBOL_TO_MINT.get(sym)
+    if mint: return mint, sym
     try:
         r = http_get(DEX_SCREENER_SEARCH, params={"q": sym}, timeout=10)
         pairs = (r.json() or {}).get("pairs", []) or []
-        pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
+        pairs = [p for p in pairs if (p.get("chainId") or "").lower()=="solana"]
         if pairs:
             best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
             mint2 = (best.get("baseToken") or {}).get("address")
-            if mint2:
-                return mint2, sym
+            if mint2: return mint2, sym
     except Exception:
         pass
     return "", sym
@@ -619,50 +591,45 @@ def blacklist(mint: str, hours=24):
     save_blacklist()
 
 def probe_trade(mint: str, user_pubkey: str):
-    # True=ok, False=échec dur, None=soft-skip (route non whitelistée/quote vide)
-    if not PROBE_ENABLED:
-        return True
+    if not PROBE_ENABLED: return True
     try:
         lamports = max(1, int(PROBE_SOL * 1_000_000_000))
 
-        # BUY quote + labels
         q_buy  = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
         if not q_buy:
-            send("🧪 probe: BUY quote vide"); return None
+            logger.info("🧪 probe BUY: quote vide"); send("🧪 probe BUY: quote vide"); return None
         ok_buy, buy_labels = route_is_whitelisted(q_buy, return_labels=True)
-        if not ok_buy:
-            send("🧪 probe: BUY non whitelist | labels=" + ", ".join([l for l in buy_labels if l])); return None
+        logger.info(f"🧪 probe BUY route labels={buy_labels} ok={ok_buy}")
+        if not ok_buy: return None
 
-        # SELL quote + labels
         q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
         if not q_sell:
-            send("🧪 probe: SELL quote vide"); return None
+            logger.info("🧪 probe SELL: quote vide"); send("🧪 probe SELL: quote vide"); return None
         ok_sell, sell_labels = route_is_whitelisted(q_sell, return_labels=True)
-        if not ok_sell:
-            send("🧪 probe: SELL non whitelist | labels=" + ", ".join([l for l in sell_labels if l])); return None
+        logger.info(f"🧪 probe SELL route labels={sell_labels} ok={ok_sell}")
+        if not ok_sell: return None
 
-        if DRY_RUN:
-            return True
+        if DRY_RUN: return True
 
-        # --- BUY with dynamic slippage + retry if slippage-like error ---
         try:
             txb64 = jup_swap_tx(q_buy, user_pubkey, use_dynamic=True)
             _ = sign_and_send(txb64)
         except Exception as e:
             if _is_jup_slippage_err(e):
-                q_buy = jup_quote(WSOL, mint, lamports, min(PROBE_SLIPPAGE_BPS * 2, MAX_SLIPPAGE_BPS))
+                logger.info("🧪 probe BUY retry slippage++")
+                q_buy = jup_quote(WSOL, mint, lamports, min(PROBE_SLIPPAGE_BPS*2, MAX_SLIPPAGE_BPS))
                 txb64 = jup_swap_tx(q_buy, user_pubkey, use_dynamic=True)
                 _ = sign_and_send(txb64)
             else:
                 raise
 
-        # --- SELL with dynamic slippage + retry ---
         try:
             txb64 = jup_swap_tx(q_sell, user_pubkey, use_dynamic=True)
             _ = sign_and_send(txb64)
         except Exception as e:
             if _is_jup_slippage_err(e):
-                q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), min(PROBE_SLIPPAGE_BPS * 2, MAX_SLIPPAGE_BPS))
+                logger.info("🧪 probe SELL retry slippage++")
+                q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), min(PROBE_SLIPPAGE_BPS*2, MAX_SLIPPAGE_BPS))
                 txb64 = jup_swap_tx(q_sell, user_pubkey, use_dynamic=True)
                 _ = sign_and_send(txb64)
             else:
@@ -670,28 +637,22 @@ def probe_trade(mint: str, user_pubkey: str):
 
         return True
     except Exception as e:
-        logger.warning("probe_trade: " + str(e))
-        return False
+        logger.warning("probe_trade: "+str(e)); send("🧪 probe exception: "+str(e)); return False
 
 # =================
 # Sizing & scoring
 # =================
 def score_pair(chg_pct: float, liq_usd: float, vol_usd: float, age_sec: float, min_liq_usd: float, min_vol_usd: float) -> str:
-    if chg_pct < ENTRY_THRESHOLD * 100:
-        return "B"
+    if chg_pct < ENTRY_THRESHOLD * 100: return "B"
     hard = (liq_usd >= min_liq_usd) and (vol_usd >= min_vol_usd) and (age_sec >= MIN_POOL_AGE_SEC)
-    if hard:
-        return "A+"
+    if hard: return "A+"
     soft = (liq_usd >= 0.9*min_liq_usd) and (vol_usd >= min_vol_usd) and (age_sec >= 0.5*MIN_POOL_AGE_SEC)
     return "A" if soft else "B"
 
 def size_for_score(balance_sol: float, score: str) -> float:
-    if score == "A+":
-        pct = POSITION_SIZE_PCT
-    elif score == "A" and ALLOW_A_TRADES:
-        pct = float(A_SIZE_PCT_ENV)
-    else:
-        return 0.0
+    if score == "A+": pct = POSITION_SIZE_PCT
+    elif score == "A" and ALLOW_A_TRADES: pct = float(A_SIZE_PCT_ENV)
+    else: return 0.0
     size_sol = max(balance_sol * pct, MIN_TRADE_SOL)
     return min(size_sol, balance_sol * 0.99)
 
@@ -702,16 +663,13 @@ def refresh_dynamic_tokens():
     global DYNAMIC_TOKENS
     try:
         sol_usd = get_sol_usd()
-        # Liquidity thresholds
         min_liq_usd = MIN_LIQ_USD if MIN_LIQ_USD > 0 else (MIN_LIQ_SOL * sol_usd)
         min_vol_usd = MIN_VOL_SOL * sol_usd
 
         pairs = fetch_pairs()
         if not pairs:
-            DYNAMIC_TOKENS = set()
-            save_dynamic_tokens()
-            send("⚠️ dynamic=0 (source vide)")
-            return DYNAMIC_TOKENS
+            DYNAMIC_TOKENS = set(); save_dynamic_tokens()
+            send("⚠️ dynamic=0 (source vide)"); return DYNAMIC_TOKENS
 
         pairs = rank_candidates(pairs, sol_usd)
 
@@ -720,37 +678,24 @@ def refresh_dynamic_tokens():
         rej_liq = rej_vol = rej_age = rej_quote = rej_dupe = 0
 
         for p in pairs:
-            if len(found) >= DYNAMIC_MAX_TOKENS:
-                break
-            if (p.get("chainId") or "").lower() != "solana":
-                continue
+            if len(found) >= DYNAMIC_MAX_TOKENS: break
+            if (p.get("chainId") or "").lower() != "solana": continue
 
             base_mint = (p.get("baseToken") or {}).get("address")
-            if not base_mint:
-                continue
-            if base_mint in found:
-                rej_dupe += 1
-                continue
-
+            base_sym  = (p.get("baseToken") or {}).get("symbol")
             quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
-            if quote_sym not in ALLOWED_QUOTES:
-                rej_quote += 1
-                continue
-
-            if per_quote.get(quote_sym, 0) >= MAX_PER_QUOTE:
-                continue
+            if not base_mint: continue
+            if base_mint in found: rej_dupe += 1; continue
+            if quote_sym not in ALLOWED_QUOTES: rej_quote += 1; continue
+            if per_quote.get(quote_sym, 0) >= MAX_PER_QUOTE: continue
 
             if not DYN_IGNORE_FILTERS:
                 liq_usd = pair_liquidity_usd(p)
                 vol_usd = pair_volume_h24_usd(p)
                 age = pair_age_sec(p)
-
-                if liq_usd < min_liq_usd:
-                    rej_liq += 1; continue
-                if vol_usd < min_vol_usd:
-                    rej_vol += 1; continue
-                if age < MIN_POOL_AGE_SEC:
-                    rej_age += 1; continue
+                if liq_usd < min_liq_usd: rej_liq += 1; continue
+                if vol_usd < min_vol_usd: rej_vol += 1; continue
+                if age < MIN_POOL_AGE_SEC: rej_age += 1; continue
 
             found.add(base_mint)
             per_quote[quote_sym] = per_quote.get(quote_sym, 0) + 1
@@ -758,16 +703,13 @@ def refresh_dynamic_tokens():
         DYNAMIC_TOKENS = found
         save_dynamic_tokens()
 
-        send("✅ dynamic=" + str(len(DYNAMIC_TOKENS))
-             + " (rejets liq=" + str(rej_liq)
-             + ", vol=" + str(rej_vol)
-             + ", age=" + str(rej_age)
-             + ", quote=" + str(rej_quote)
-             + ", dupe=" + str(rej_dupe) + ")")
+        sample = list(DYNAMIC_TOKENS)[:LOG_SAMPLE_LIMIT]
+        logger.info(f"[dyn] tokens={len(DYNAMIC_TOKENS)} sample={','.join([short_mint(x) for x in sample])}")
+        send("✅ dynamic="+str(len(DYNAMIC_TOKENS))
+             + f" (rejets liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote}, dupe={rej_dupe})")
         return DYNAMIC_TOKENS
     except Exception as e:
-        send("⚠️ dynamic=0 (erreur: " + str(e) + ")")
-        return set()
+        send("⚠️ dynamic=0 (erreur: "+str(e)+")"); return set()
 
 def final_whitelist() -> Set[str]:
     fixed = {WSOL, USDC,
@@ -782,51 +724,40 @@ def final_whitelist() -> Set[str]:
 # Trading
 # ======================
 def enter_trade(pair: dict, sol_usd: float, score: str):
-    if not can_open_more():
-        return
+    if not can_open_more(): return
     base_mint = (pair.get("baseToken") or {}).get("address")
     base_sym  = (pair.get("baseToken") or {}).get("symbol") or "TOKEN"
     pair_url  = pair.get("url") or "https://dexscreener.com/solana"
     wl = final_whitelist()
-    if not base_mint or base_mint in positions or base_mint not in wl or is_blacklisted(base_mint):
-        return
+    if not base_mint or base_mint in positions or base_mint not in wl or is_blacklisted(base_mint): return
     balance = get_balance_sol()
     size_sol = size_for_score(balance, score)
-    if size_sol <= 0:
-        return
+    if size_sol <= 0: return
     lamports = int(size_sol * 1_000_000_000)
     if lamports <= 0:
         send("❌ Achat annulé: solde SOL insuffisant"); return
     trade_id = new_trade_id()
 
-    # Sonde — soft/hard outcomes
     probe_res = probe_trade(base_mint, str(kp.public_key))
     if probe_res is False:
-        blacklist(base_mint, hours=24)
-        send("🧪 Sonde KO → blacklist 24h : " + base_mint)
-        return
+        blacklist(base_mint, hours=24); send("🧪 Sonde KO → blacklist 24h : "+base_mint); return
     elif probe_res is None:
-        # route/quote non whitelistés → skip proprement
-        return
+        send("🧪 Sonde skip (route/quote) pour "+base_sym+" — pas de blacklist"); return
 
     try:
         q = jup_quote(WSOL, base_mint, lamports, SLIPPAGE_BPS)
-        if not q or not route_is_whitelisted(q):
-            send("⛔ Route non whitelist pour " + base_sym + " — rejet"); return
+        ok_route, labels = route_is_whitelisted(q, return_labels=True)
+        if not q or not ok_route:
+            send("⛔ Route non whitelist pour "+base_sym+" — labels="+", ".join([l for l in labels if l])+" — rejet"); return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
-        send("📈 Achat " + base_sym + " [" + score + "]\nMontant: " + f"{size_sol:.4f}" + " SOL\nPair: " + pair_url + "\nID: " + trade_id + "\nTx: " + str(sig))
+        send("📈 Achat "+base_sym+" ["+score+"]\nMontant: "+f"{size_sol:.4f}"+" SOL\nPair: "+pair_url+"\nID: "+trade_id+"\nTx: "+str(sig))
     except Exception as e:
-        send("❌ Achat " + base_sym + " échoué: " + str(e)); return
+        send("❌ Achat "+base_sym+" échoué: "+str(e)); return
 
     price_sol = pair_price_in_sol(pair, sol_usd)
     positions[base_mint] = {
-        "symbol": base_sym,
-        "entry_price_sol": price_sol,
-        "peak_price_sol": price_sol,
-        "pair_url": pair_url,
-        "opened_at": now_str(),
-        "score": score,
-        "trade_id": trade_id,
+        "symbol": base_sym, "entry_price_sol": price_sol, "peak_price_sol": price_sol,
+        "pair_url": pair_url, "opened_at": now_str(), "score": score, "trade_id": trade_id,
     }
     save_positions()
 
@@ -834,15 +765,16 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
     try:
         bal_amount = get_token_balance(mint)
         if bal_amount <= 0:
-            send(reason + " " + symbol + ": aucun solde token détecté (déjà vendu ?)"); return True
+            send(reason+" "+symbol+": aucun solde token détecté (déjà vendu ?)"); return True
         q = jup_quote(mint, WSOL, int(bal_amount * 0.99), SLIPPAGE_BPS)
-        if not q or not route_is_whitelisted(q):
-            send("⛔ Route non whitelist à la vente pour " + symbol + " — tentative annulée"); return False
+        ok_route, labels = route_is_whitelisted(q, return_labels=True)
+        if not q or not ok_route:
+            send("⛔ Route non whitelist à la vente pour "+symbol+" — labels="+", ".join([l for l in labels if l])+" — tentative annulée"); return False
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
-        send(reason + " " + symbol + "\nTx: " + str(sig))
+        send(reason+" "+symbol+"\nTx: "+str(sig))
         return True
     except Exception as e:
-        send("❌ Vente " + symbol + " échouée: " + str(e)); return False
+        send("❌ Vente "+symbol+" échouée: "+str(e)); return False
 
 def check_positions(sol_usd: float):
     to_close = []
@@ -853,49 +785,47 @@ def check_positions(sol_usd: float):
         try:
             r = http_get(DEX_TOKENS_BY_MINT + "/" + mint, timeout=15)
             pairs = r.json() or []
-            if not pairs:
-                continue
+            if not pairs: continue
             pair = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
             price = pair_price_in_sol(pair, sol_usd)
-            if math.isnan(price) or price <= 0:
-                continue
+            if math.isnan(price) or price <= 0: continue
         except Exception:
             continue
         if price > peak:
             pos["peak_price_sol"] = price; peak = price; save_positions()
         if entry and (entry - price) / entry >= STOP_LOSS_PCT:
-            if close_position(mint, symbol, "🛑 Stop-loss"):
-                to_close.append(mint); continue
+            if close_position(mint, symbol, "🛑 Stop-loss"): to_close.append(mint); continue
         gain_from_entry = (price - entry) / entry if entry else 0.0
         drop_from_peak  = (peak - price) / peak if peak else 0.0
         if gain_from_entry >= TRAILING_TRIGGER_PCT and drop_from_peak >= TRAILING_THROWBACK_PCT:
-            if close_position(mint, symbol, "✅ Trailing take-profit"):
-                to_close.append(mint); continue
-    for m in to_close:
-        positions.pop(m, None)
-    if to_close:
-        save_positions()
+            if close_position(mint, symbol, "✅ Trailing take-profit"): to_close.append(mint); continue
+    for m in to_close: positions.pop(m, None)
+    if to_close: save_positions()
 
 # ====================
 # Market scan
 # ====================
 def scan_market():
-    if HALT_TRADING:
-        return
+    if HALT_TRADING: return
     try:
         sol_usd = get_sol_usd()
         min_liq_usd = MIN_LIQ_USD if MIN_LIQ_USD > 0 else (MIN_LIQ_SOL * sol_usd)
         min_vol_usd = MIN_VOL_SOL * sol_usd
 
         pairs = fetch_pairs()
-        if not pairs:
-            return
+        if not pairs: return
         pairs = rank_candidates(pairs, sol_usd)
         wl = final_whitelist()
         candidates = []
+        debug_sent = 0
+
         for p in pairs:
             base_mint = (p.get("baseToken") or {}).get("address")
-            if not base_mint or base_mint not in wl:
+            base_sym  = (p.get("baseToken") or {}).get("symbol") or "?"
+            if not base_mint: continue
+            if base_mint not in wl:
+                if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
+                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale"; logger.info(msg); send(msg); debug_sent += 1
                 continue
 
             liq_usd = pair_liquidity_usd(p)
@@ -903,27 +833,36 @@ def scan_market():
             age = pair_age_sec(p)
 
             if not DYN_IGNORE_FILTERS:
-                if liq_usd < min_liq_usd or vol_usd < min_vol_usd or age < MIN_POOL_AGE_SEC:
+                reasons = []
+                if liq_usd < min_liq_usd: reasons.append(f"liq ${liq_usd:.0f}<{min_liq_usd:.0f}")
+                if vol_usd < min_vol_usd: reasons.append(f"vol ${vol_usd:.0f}<{min_vol_usd:.0f}")
+                if age < MIN_POOL_AGE_SEC: reasons.append(f"age {int(age)}<{MIN_POOL_AGE_SEC}s")
+                if reasons:
+                    if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
+                        msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: "+", ".join(reasons); logger.info(msg); send(msg); debug_sent += 1
                     continue
 
             chg = get_price_change_pct(p, PRICE_WINDOW)
-            if math.isnan(chg):
-                continue
+            if math.isnan(chg): continue
             score = score_pair(chg, liq_usd, vol_usd, age, min_liq_usd, min_vol_usd)
-            if score in ("A+", "A"):
+            if score in ("A+","A"):
                 candidates.append((chg, score, p))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
+        opened = 0
         for chg, score, p in candidates:
-            if not can_open_more():
-                break
+            if not can_open_more(): break
             base_mint = (p.get("baseToken") or {}).get("address")
-            if not base_mint or base_mint in positions:
-                continue
-            enter_trade(p, sol_usd, score)
+            if not base_mint or base_mint in positions: continue
+            enter_trade(p, sol_usd, score); opened += 1
+
         check_positions(sol_usd)
+
+        if DEBUG_REJECTIONS and opened == 0:
+            logger.info(f"[scan] aucun trade ouvert — candidats={len(candidates)} dyn={len(DYNAMIC_TOKENS)}")
+
     except Exception as e:
-        send("⚠️ [scan error] " + type(e).__name__ + ": " + str(e))
+        send("⚠️ [scan error] "+type(e).__name__+": "+str(e))
 
 # ==============================
 # Diagnostics & résumés
@@ -933,15 +872,15 @@ def health_check():
     try:
         bal = get_balance_sol(); results["rpc"] = bal >= 0; results["balance"] = bal
     except Exception as e:
-        results["rpc"] = False; results["balance"] = "err: " + str(e)
+        results["rpc"] = False; results["balance"] = "err: "+str(e)
     try:
         p = get_sol_usd(); results["jup_price"] = p > 0; results["sol_usd"] = p
     except Exception as e:
-        results["jup_price"] = False; results["sol_usd"] = "err: " + str(e)
+        results["jup_price"] = False; results["sol_usd"] = "err: "+str(e)
     try:
         pairs = fetch_pairs(); results["dex_search"] = len(pairs) > 0; results["pairs_count"] = len(pairs)
     except Exception as e:
-        results["dex_search"] = False; results["pairs_count"] = "err: " + str(e)
+        results["dex_search"] = False; results["pairs_count"] = "err: "+str(e)
     try:
         test_amt = int(0.01 * 1_000_000_000)
         q = jup_quote(WSOL, USDC, test_amt, min(SLIPPAGE_BPS, 50))
@@ -953,22 +892,22 @@ def health_check():
 def send_boot_diagnostics():
     res = health_check()
     msg = (
-        "[" + BOT_VERSION + "] 🩺 Self-check démarrage\n"
-        + "RPC: " + ok(res.get("rpc", False)) + " | Solde: " + str(res.get("balance")) + "\n"
-        + "Jupiter Price: " + ok(res.get("jup_price", False)) + " | SOL≈" + str(res.get("sol_usd")) + "\n"
-        + "Source marché: " + ok(res.get("dex_search", False)) + " | pairs=" + str(res.get("pairs_count")) + "\n"
-        + "Jupiter quote: " + ok(res.get("jup_quote", False)) + "\n"
-        + "Params ⇒ Seuil " + str(int(ENTRY_THRESHOLD*100)) + "% | SL -" + str(int(STOP_LOSS_PCT*100)) + "% | "
-        + "Trailing +" + str(int(TRAILING_TRIGGER_PCT*100)) + "% / -" + str(int(TRAILING_THROWBACK_PCT*100)) + "% | "
-        + "Max " + str(MAX_OPEN_TRADES) + " | Taille A+: " + str(int(POSITION_SIZE_PCT*100)) + "% | A: " + str(int(float(A_SIZE_PCT_ENV)*100)) + "%\n"
-        + "Filtres: Liqu≥" + (str(MIN_LIQ_USD) + " USD" if MIN_LIQ_USD > 0 else (str(MIN_LIQ_SOL) + " SOL"))
-        + ", Vol≥" + str(MIN_VOL_SOL) + " SOL, Âge≥" + str(MIN_POOL_AGE_SEC//60) + "min | Fenêtre: " + PRICE_WINDOW + "\n"
-        + "Quotes dyn: " + ",".join(sorted(ALLOWED_QUOTES)) + " | Prot: " + ",".join(sorted(ALLOWED_PROTOCOLS)) + " | WL-mode: " + WHITELIST_MODE
+        "["+BOT_VERSION+"] 🩺 Self-check démarrage\n"
+        + "RPC: "+ok(res.get("rpc", False))+" | Solde: "+str(res.get("balance"))+"\n"
+        + "Jupiter Price: "+ok(res.get("jup_price", False))+" | SOL≈"+str(res.get("sol_usd"))+"\n"
+        + "Source marché: "+ok(res.get("dex_search", False))+" | pairs="+str(res.get("pairs_count"))+"\n"
+        + "Jupiter quote: "+ok(res.get("jup_quote", False))+"\n"
+        + "Params ⇒ Seuil "+str(int(ENTRY_THRESHOLD*100))+"% | SL -"+str(int(STOP_LOSS_PCT*100))+"% | "
+        + "Trailing +"+str(int(TRAILING_TRIGGER_PCT*100))+"% / -"+str(int(TRAILING_THROWBACK_PCT*100))+"% | "
+        + "Max "+str(MAX_OPEN_TRADES)+" | Taille A+: "+str(int(POSITION_SIZE_PCT*100))+"% | A: "+str(int(float(A_SIZE_PCT_ENV)*100))+"%\n"
+        + "Filtres: Liqu≥"+(str(MIN_LIQ_USD)+" USD" if MIN_LIQ_USD>0 else (str(MIN_LIQ_SOL)+" SOL"))
+        + ", Vol≥"+str(MIN_VOL_SOL)+" SOL, Âge≥"+str(MIN_POOL_AGE_SEC//60)+"min | Fenêtre: "+PRICE_WINDOW+"\n"
+        + "Quotes dyn: "+",".join(sorted(ALLOWED_QUOTES))+" | Prot: "+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-mode: "+WHITELIST_MODE
     )
     send(msg)
 
 def heartbeat():
-    send("⏱️ Heartbeat " + now_str() + " | positions: " + str(len(positions)) + " | blacklist: " + str(len(BLACKLIST)) + " | dyn: " + str(len(DYNAMIC_TOKENS)) + " | halt=" + str(HALT_TRADING))
+    send("⏱️ Heartbeat "+now_str()+" | positions: "+str(len(positions))+" | blacklist: "+str(len(BLACKLIST))+" | dyn: "+str(len(DYNAMIC_TOKENS))+" | halt="+str(HALT_TRADING))
 
 def daily_summary():
     if positions:
@@ -976,11 +915,11 @@ def daily_summary():
         for m, p in positions.items():
             ep = p.get('entry_price_sol') or 0.0
             pk = p.get('peak_price_sol') or 0.0
-            lines.append("- " + p['symbol'] + " [" + p.get('score','?') + "] | entry " + f"{ep:.6f}" + " SOL | peak " + f"{pk:.6f}" + " SOL")
+            lines.append("- "+p['symbol']+" ["+p.get('score','?')+"] | entry "+f\"{ep:.6f}\"+" SOL | peak "+f\"{pk:.6f}\"+" SOL")
         body = "\n".join(lines)
     else:
         body = "Aucune position ouverte."
-    send("📰 Résumé quotidien " + now_str() + "\n" + body)
+    send("📰 Résumé quotidien "+now_str()+"\n"+body)
 
 # ======================
 # Telegram commands
@@ -993,108 +932,99 @@ def handle_command(text: str, chat_id: str = None):
     elif tl.startswith("/stop"):
         HALT_TRADING = True; send("⏸️ Trading en pause.")
     elif tl.startswith("/status"):
-        send("ℹ️ Status " + now_str() + " | positions: " + str(len(positions)) + " | blacklist: " + str(len(BLACKLIST)) + " | dyn: " + str(len(DYNAMIC_TOKENS)) + " | halt=" + str(HALT_TRADING))
+        send("ℹ️ Status "+now_str()+" | positions: "+str(len(positions))+" | blacklist: "+str(len(BLACKLIST))+" | dyn: "+str(len(DYNAMIC_TOKENS))+" | halt="+str(HALT_TRADING))
     elif tl.startswith("/testtrade"):
         try:
             amt = max(0.002, PROBE_SOL); lamports = int(amt * 1_000_000_000)
             q = jup_quote(WSOL, USDC, lamports, min(SLIPPAGE_BPS, 50))
-            if not q or not route_is_whitelisted(q): send("🔍 TestTrade: route non whitelist ou quote vide"); return
+            ok_route, labels = route_is_whitelisted(q, return_labels=True)
+            if not q or not ok_route: send("🔍 TestTrade: route non whitelist | labels="+", ".join([l for l in labels if l])); return
             sig1 = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
             q2 = jup_quote(USDC, WSOL, int(float(q.get("outAmount","0"))*0.98), min(SLIPPAGE_BPS, 50))
-            if not q2 or not route_is_whitelisted(q2): send("🔍 TestTrade SELL: route non whitelist ou quote vide"); return
+            ok_route2, labels2 = route_is_whitelisted(q2, return_labels=True)
+            if not q2 or not ok_route2: send("🔍 TestTrade SELL: route non whitelist | labels="+", ".join([l for l in labels2 if l])); return
             sig2 = sign_and_send(jup_swap_tx(q2, str(kp.public_key), use_dynamic=True))
-            send("✅ TestTrade OK\nBuy Tx: " + str(sig1) + "\nSell Tx: " + str(sig2))
+            send("✅ TestTrade OK\nBuy Tx: "+str(sig1)+"\nSell Tx: "+str(sig2))
         except Exception as e:
-            send("❌ TestTrade error: " + str(e))
+            send("❌ TestTrade error: "+str(e))
     elif tl.startswith("/refresh_tokens"):
         refresh_token_map(); refresh_dynamic_tokens()
     elif tl.startswith("/dyninfo"):
         try: refresh_dynamic_tokens()
-        except Exception as e: send("/dyninfo erreur: " + str(e))
+        except Exception as e: send("/dyninfo erreur: "+str(e))
     elif tl.startswith("/forcebuy"):
         try:
             parts = t.split()
-            if len(parts) < 3:
-                send("Usage: /forcebuy <SYMBOL_ou_MINT> <montant_SOL>"); return
+            if len(parts) < 3: send("Usage: /forcebuy <SYMBOL_ou_MINT> <montant_SOL>"); return
             token = parts[1]; size_sol = float(parts[2])
             mint, sym = resolve_symbol_or_mint(token)
-            if not mint: send("Token introuvable: " + token); return
-            if is_blacklisted(mint): send("Token blacklist: " + mint); return
+            if not mint: send("Token introuvable: "+token); return
+            if is_blacklisted(mint): send("Token blacklist: "+mint); return
             if not PROBE_ENABLED or probe_trade(mint, str(kp.public_key)):
                 lamports = int(size_sol * 1_000_000_000)
                 q = jup_quote(WSOL, mint, lamports, SLIPPAGE_BPS)
-                if not q or not route_is_whitelisted(q):
-                    send("Route non whitelistée pour /forcebuy"); return
+                ok_route, labels = route_is_whitelisted(q, return_labels=True)
+                if not q or not ok_route:
+                    send("Route non whitelistée pour /forcebuy | labels="+", ".join([l for l in labels if l])); return
                 sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
-                send("🚨 FORCE BUY " + sym + " (" + mint + ")\nMontant: " + f"{size_sol:.4f}" + " SOL\nTx: " + str(sig))
+                send("🚨 FORCE BUY "+sym+" ("+mint+")\nMontant: "+f\"{size_sol:.4f}\"+" SOL\nTx: "+str(sig))
             else:
                 send("Sonde anti-honeypot KO — /forcebuy annulé.")
         except Exception as e:
-            send("/forcebuy erreur: " + str(e))
+            send("/forcebuy erreur: "+str(e))
     elif tl.startswith("/reset_offset"):
         try:
             if os.path.exists(TG_OFFSET_PATH): os.remove(TG_OFFSET_PATH)
             send("♻️ Telegram offset reset. Réessayez vos commandes.")
         except Exception as e:
-            send("reset_offset erreur: " + str(e))
+            send("reset_offset erreur: "+str(e))
     elif tl.startswith("/whoami"):
-        if chat_id: send_to(chat_id, "Votre chat_id: " + chat_id)
+        if chat_id: send_to(chat_id, "Votre chat_id: "+chat_id)
         else: send("(whoami) chat_id indisponible")
     elif tl.startswith("/version"):
-        send(BOT_VERSION + " | quotes=" + ",".join(sorted(ALLOWED_QUOTES)) + " | protos=" + ",".join(sorted(ALLOWED_PROTOCOLS)) + " | WL-mode=" + WHITELIST_MODE)
+        send(BOT_VERSION+" | quotes="+",".join(sorted(ALLOWED_QUOTES))+" | protos="+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-mode="+WHITELIST_MODE)
 
 def poll_telegram():
-    if not TOKEN:
-        return
+    if not TOKEN: return
     try:
         offset = _load_tg_offset()
-        r = http_get(
-            "https://api.telegram.org/bot" + TOKEN + "/getUpdates",
-            params={"timeout": 0, "offset": offset+1, "allowed_updates": json.dumps(["message"])},
-            timeout=10
-        )
-        data = r.json() or {}
-        upd = data.get("result", []) or []
-        last = offset
+        r = http_get("https://api.telegram.org/bot"+TOKEN+"/getUpdates",
+                     params={"timeout": 0, "offset": offset+1, "allowed_updates": json.dumps(["message"])},
+                     timeout=10)
+        data = r.json() or {}; upd = data.get("result", []) or []; last = offset
         for u in upd:
             last = max(last, int(u.get("update_id", 0)))
             msg = u.get("message") or {}
             chat_id = str(((msg.get("chat") or {}).get("id")) or "")
             text = (msg.get("text") or "").strip()
             if CHAT and chat_id != str(CHAT):
-                if text.lower().startswith("/whoami"):
-                    send_to(chat_id, "Votre chat_id: " + chat_id)
+                if text.lower().startswith("/whoami"): send_to(chat_id, "Votre chat_id: "+chat_id)
                 continue
-            if not text:
-                continue
+            if not text: continue
             handle_command(text, chat_id)
-        if last != offset:
-            _save_tg_offset(last)
+        if last != offset: _save_tg_offset(last)
     except Exception as e:
-        logger.warning("poll_telegram: " + str(e))
+        logger.warning("poll_telegram: "+str(e))
 
 # ======================
-# Boot message
+# Boot
 # ======================
 def boot_message():
     b = get_balance_sol()
-    send("[" + BOT_VERSION + "] 🚀 Bot prêt ✅\n"
-         + "Seuil: " + str(int(ENTRY_THRESHOLD*100)) + "% | SL: -" + str(int(STOP_LOSS_PCT*100)) + "% | "
-         + "Trailing: +" + str(int(TRAILING_TRIGGER_PCT*100)) + "% / -" + str(int(TRAILING_THROWBACK_PCT*100)) + "%\n"
-         + "Max trades: " + str(MAX_OPEN_TRADES) + " | Taille A+: " + str(int(POSITION_SIZE_PCT*100)) + "% | A: " + str(int(float(A_SIZE_PCT_ENV)*100)) + "%\n"
-         + "Filtres: Liqu≥" + (str(MIN_LIQ_USD) + " USD" if MIN_LIQ_USD > 0 else (str(MIN_LIQ_SOL) + " SOL"))
-         + ", Vol≥" + str(MIN_VOL_SOL) + " SOL, Âge≥" + str(MIN_POOL_AGE_SEC//60) + "min | Fenêtre: " + PRICE_WINDOW + "\n"
-         + "DRY_RUN: " + str(DRY_RUN) + " | PROBE: " + str(PROBE_ENABLED) + " (" + str(PROBE_SOL) + " SOL; " + str(PROBE_SLIPPAGE_BPS) + "bps)" + "\n"
-         + "Quotes dyn: " + ",".join(sorted(ALLOWED_QUOTES)) + " | dynamique max: " + str(DYNAMIC_MAX_TOKENS) + "\n"
-         + "Protocols: " + ",".join(sorted(ALLOWED_PROTOCOLS)) + " | WL-mode: " + WHITELIST_MODE
+    send("["+BOT_VERSION+"] 🚀 Bot prêt ✅\n"
+         + "Seuil: "+str(int(ENTRY_THRESHOLD*100))+"% | SL: -"+str(int(STOP_LOSS_PCT*100))+"% | "
+         + "Trailing: +"+str(int(TRAILING_TRIGGER_PCT*100))+"% / -"+str(int(TRAILING_THROWBACK_PCT*100))+"%\n"
+         + "Max trades: "+str(MAX_OPEN_TRADES)+" | Taille A+: "+str(int(POSITION_SIZE_PCT*100))+"% | A: "+str(int(float(A_SIZE_PCT_ENV)*100))+"%\n"
+         + "Filtres: Liqu≥"+(str(MIN_LIQ_USD)+" USD" if MIN_LIQ_USD>0 else (str(MIN_LIQ_SOL)+" SOL"))
+         + ", Vol≥"+str(MIN_VOL_SOL)+" SOL, Âge≥"+str(MIN_POOL_AGE_SEC//60)+"min | Fenêtre: "+PRICE_WINDOW+"\n"
+         + "DRY_RUN: "+str(DRY_RUN)+" | PROBE: "+str(PROBE_ENABLED)+" ("+str(PROBE_SOL)+" SOL; "+str(PROBE_SLIPPAGE_BPS)+"bps)\n"
+         + "Quotes dyn: "+",".join(sorted(ALLOWED_QUOTES))+" | dynamique max: "+str(DYNAMIC_MAX_TOKENS)+"\n"
+         + "Protocols: "+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-mode: "+WHITELIST_MODE
     )
 
-# ======================
-# Init & Scheduler
-# ======================
 def main():
     load_positions(); load_blacklist(); load_dynamic_tokens(); load_token_map()
-    boot_message(); refresh_token_map(); refresh_dynamic_tokens(); send_boot_diagnostics()
+    boot_message(); log_env_config(); refresh_token_map(); refresh_dynamic_tokens(); send_boot_diagnostics()
 
     scheduler = BackgroundScheduler(timezone=TZ)
     scheduler.add_job(scan_market, "interval", seconds=SCAN_INTERVAL_SEC, id="scan")
@@ -1111,8 +1041,7 @@ def main():
     signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
 
     try:
-        while running:
-            time.sleep(1)
+        while running: time.sleep(1)
     finally:
         scheduler.shutdown(); print("[exit] bye")
 
