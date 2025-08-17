@@ -16,7 +16,7 @@ from solana.rpc.types import TxOpts
 # ======================
 # Version & ENV
 # ======================
-BOT_VERSION = os.getenv("BOT_VERSION", "v1.4-optimal-2025-08-17")
+BOT_VERSION = os.getenv("BOT_VERSION", "v1.4-optimal-probe-2025-08-17")
 
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -39,7 +39,9 @@ MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 
 PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1"
-PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.003"))
+PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.005"))
+PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
+PROBE_SELL_FACTOR        = float(os.getenv("PROBE_SELL_FACTOR", "0.95"))
 
 MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "1.0"))
 MIN_VOL_SOL              = float(os.getenv("MIN_VOL_SOL", "0.5"))
@@ -82,7 +84,7 @@ ALLOWED_QUOTES: Set[str] = {
     q.strip().upper() for q in os.getenv("ALLOWED_QUOTES", "SOL,WSOL,USDC,USDT").split(",") if q.strip()
 }
 ALLOWED_PROTOCOLS = {"Raydium", "Orca", "Phoenix", "Lifinity"}
-EXTRA_PROTOCOLS = os.getenv("ALLOWED_PROTOCOLS_EXTRA", "")
+EXTRA_PROTOCOLS = os.getenv("ALLOWED_PROTOCOLS_EXTRA", "Meteora,Saber,OpenBook")
 if EXTRA_PROTOCOLS:
     ALLOWED_PROTOCOLS |= {p.strip() for p in EXTRA_PROTOCOLS.split(",") if p.strip()}
 
@@ -353,13 +355,13 @@ def pair_age_sec(pair: dict) -> float:
     return 0.0
 
 # ======================
-# Ranking (momentum + quality)
+# Ranking
 # ======================
 def _candidate_score(p: dict, sol_usd: float) -> float:
     ch5 = float(get_price_change_pct(p, "m5") or 0.0)
     ch1 = float(get_price_change_pct(p, "h1") or 0.0)
-    v   = pair_volume_h24_usd(p)            # USD
-    liq = pair_liquidity_usd(p)             # USD
+    v   = pair_volume_h24_usd(p)
+    liq = pair_liquidity_usd(p)
     v_term   = min(v / (sol_usd * 5.0), 2.0)
     liq_term = min(liq / (sol_usd * 10.0), 1.0)
     return (ch5 * 1.0) + (max(ch1, 0.0) * 0.5) + v_term + liq_term
@@ -510,15 +512,27 @@ def blacklist(mint: str, hours=24):
 def probe_trade(mint: str, user_pubkey: str) -> bool:
     if not PROBE_ENABLED: return True
     try:
-        lamports = int(PROBE_SOL * 1_000_000_000)
-        q_buy = jup_quote(WSOL, mint, lamports, min(SLIPPAGE_BPS, 50))
-        if not q_buy or not route_is_whitelisted(q_buy): return False
-        if not DRY_RUN:
-            txb = jup_swap_tx(q_buy, user_pubkey); sign_and_send(txb)
-        q_sell = jup_quote(mint, WSOL, int(lamports*0.95), min(SLIPPAGE_BPS, 50))
-        if not q_sell or not route_is_whitelisted(q_sell): return False
-        if not DRY_RUN:
-            txs = jup_swap_tx(q_sell, user_pubkey); sign_and_send(txs)
+        lamports = max(1, int(PROBE_SOL * 1_000_000_000))
+
+        # 1) Préflights: on vérifie BUY et SELL avant d'acheter
+        q_buy  = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
+        q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
+
+        if not q_buy:
+            send("🧪 probe: BUY quote vide"); return False
+        if not route_is_whitelisted(q_buy):
+            send("🧪 probe: BUY route non whitelistée"); return False
+
+        if not q_sell:
+            send("🧪 probe: SELL quote vide"); return False
+        if not route_is_whitelisted(q_sell):
+            send("🧪 probe: SELL route non whitelistée"); return False
+
+        # 2) Exécution uniquement si pas en DRY_RUN
+        if DRY_RUN:
+            return True
+        _ = sign_and_send(jup_swap_tx(q_buy, user_pubkey))
+        _ = sign_and_send(jup_swap_tx(q_sell, user_pubkey))
         return True
     except Exception as e:
         logger.warning("probe_trade: " + str(e))
@@ -662,7 +676,7 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         send(reason + " " + symbol + "\nTx: " + str(sig))
         return True
     except Exception as e:
-        send("❌ Vente " + symbol + " échoué: " + str(e)); return False
+        send("❌ Vente " + symbol + " échouée: " + str(e)); return False
 
 def check_positions(sol_usd: float):
     to_close = []
@@ -881,7 +895,7 @@ def boot_message():
          + "Trailing: +" + str(int(TRAILING_TRIGGER_PCT*100)) + "% / -" + str(int(TRAILING_THROWBACK_PCT*100)) + "%\n"
          + "Max trades: " + str(MAX_OPEN_TRADES) + " | Taille A+: " + str(int(POSITION_SIZE_PCT*100)) + "% | A: " + str(int(float(A_SIZE_PCT_ENV)*100)) + "%\n"
          + "Filtres: Liqu≥" + str(MIN_LIQ_SOL) + " SOL, Vol≥" + str(MIN_VOL_SOL) + " SOL, Âge≥" + str(MIN_POOL_AGE_SEC//3600) + "h | Fenêtre: " + PRICE_WINDOW + "\n"
-         + "DRY_RUN: " + str(DRY_RUN) + " | PROBE: " + str(PROBE_ENABLED) + " (" + str(PROBE_SOL) + " SOL)\n"
+         + "DRY_RUN: " + str(DRY_RUN) + " | PROBE: " + str(PROBE_ENABLED) + " (" + str(PROBE_SOL) + " SOL; " + str(PROBE_SLIPPAGE_BPS) + "bps)" + "\n"
          + "Quotes dyn: " + ",".join(sorted(ALLOWED_QUOTES)) + " | dynamique max: " + str(DYNAMIC_MAX_TOKENS) + "\n"
          + "Protocols: " + ",".join(sorted(ALLOWED_PROTOCOLS))
     )
