@@ -91,7 +91,16 @@ JUP_TOKEN_LIST = "https://token.jup.ag/all"  # renvoie liste complète {mint:{sy
 
 # DexScreener
 DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"     # ?q=solana
+DEX_PAIRS_SOLANA    = "https://api.dexscreener.com/latest/dex/pairs/solana"
 DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"      # + /{mint}
+
+# Quotes autorisées pour la whitelist dynamique (configurable via Railway)
+ALLOWED_QUOTES = {
+    q.strip().upper()
+    for q in os.getenv("ALLOWED_QUOTES", "SOL,WSOL,USDC").split(",")
+    if q.strip()
+}
+
 
 # Whitelist de protocoles pour routes Jupiter
 ALLOWED_PROTOCOLS = {"Raydium", "Orca", "Phoenix", "Lifinity"}
@@ -310,7 +319,16 @@ def get_sol_usd() -> float:
         return 150.0
 
 def fetch_pairs() -> list:
-    """Récupère des paires Solana via /search?q=solana et filtre chainId='solana'."""
+    """Récupère un large set de paires Solana. Tente /pairs/solana puis fallback /search."""
+    try:
+        r = http_get(DEX_PAIRS_SOLANA, timeout=20)
+        data = r.json() or {}
+        pairs = data.get("pairs", []) or data or []
+        pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
+        if pairs:
+            return pairs
+    except Exception as e:
+        logger.debug(f"fetch_pairs primary failed: {e}")
     try:
         r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
         data = r.json() or {}
@@ -579,7 +597,7 @@ def refresh_dynamic_tokens():
             quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
             if not base_mint:
                 continue
-            if quote_sym not in ("SOL", "WSOL", "USDC"):
+            if quote_sym not in ALLOWED_QUOTES:
                 continue
             found.add(base_mint)
         DYNAMIC_TOKENS = found
