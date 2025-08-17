@@ -403,7 +403,14 @@ def fetch_pairs() -> list:
                             continue
                         seen.add(pid)
                         results.append(p)
-            exdef get_price_change_pct(pair: dict, window: str) -> float:
+            except Exception as e:
+                logger.debug(f"tokens batch failed: {e}")
+    except Exception as e:
+        logger.debug(f"boosts fetch failed: {e}")
+    return results
+
+
+def get_price_change_pct(pair: dict, window: str) -> float:
     pc = pair.get("priceChange", {})
     val = pc.get(window)
     try:
@@ -411,13 +418,16 @@ def fetch_pairs() -> list:
     except Exception:
         return float("nan")
 
+
 def pair_liquidity_usd(pair: dict) -> float:
     liq = pair.get("liquidity", {})
     return float(liq.get("usd") or 0.0)
 
+
 def pair_volume_h24_usd(pair: dict) -> float:
     vol = pair.get("volume", {})
     return float(vol.get("h24") or 0.0)
+
 
 def pair_price_in_sol(pair: dict, sol_usd: float) -> float:
     price_native = pair.get("priceNative")
@@ -434,6 +444,7 @@ def pair_price_in_sol(pair: dict, sol_usd: float) -> float:
         except Exception:
             pass
     return float("nan")
+
 
 def pair_age_sec(pair: dict) -> float:
     ts = pair.get("pairCreatedAt")
@@ -749,7 +760,11 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         if not q or not route_is_whitelisted(q):
             send(f"⛔ Route non whitelist pour {base_sym} — rejet"); return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send(f"📈 Achat {base_sym} [{score}]\nMontant: {size_sol:.4f} SOL\nPair: {pair_url}\nID: {trade_id}\nTx: {sig}")
+        send(f"📈 Achat {base_sym} [{score}]
+Montant: {size_sol:.4f} SOL
+Pair: {pair_url}
+ID: {trade_id}
+Tx: {sig}")
     except Exception as e:
         send(f"❌ Achat {base_sym} échoué: {e}"); return
     price_sol = pair_price_in_sol(pair, sol_usd)
@@ -774,7 +789,8 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         if not q or not route_is_whitelisted(q):
             send(f"⛔ Route non whitelist à la vente pour {symbol} — tentative annulée"); return False
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send(f"{reason} {symbol}\nTx: {sig}")
+        send(f"{reason} {symbol}
+Tx: {sig}")
         return True
     except Exception as e:
         send(f"❌ Vente {symbol} échouée: {e}"); return False
@@ -873,17 +889,26 @@ def health_check():
 def send_boot_diagnostics():
     res = health_check()
     msg = (
-        f"[{BOT_VERSION}] 🩺 Self-check démarrage\n"
-        f"RPC: {ok(res.get('rpc', False))} | Solde: {res.get('balance')}\n"
-        f"Jupiter Price: {ok(res.get('jup_price', False))} | SOL≈{res.get('sol_usd')}\n"
-        f"DexScreener: {ok(res.get('dex_search', False))} | pairs={res.get('pairs_count')}\n"
-        f"Jupiter quote: {ok(res.get('jup_quote', False))}\n"
+        f"[{BOT_VERSION}] 🩺 Self-check démarrage
+"
+        f"RPC: {ok(res.get('rpc', False))} | Solde: {res.get('balance')}
+"
+        f"Jupiter Price: {ok(res.get('jup_price', False))} | SOL≈{res.get('sol_usd')}
+"
+        f"DexScreener: {ok(res.get('dex_search', False))} | pairs={res.get('pairs_count')}
+"
+        f"Jupiter quote: {ok(res.get('jup_quote', False))}
+"
         f"Params ⇒ Seuil {int(ENTRY_THRESHOLD*100)}% | SL -{int(STOP_LOSS_PCT*100)}% | "
         f"Trailing +{int(TRAILING_TRIGGER_PCT*100)}% / -{int(TRAILING_THROWBACK_PCT*100)}% | "
-        f"Max {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: {A_SIZE_PCT_ENV or '15%'}{' (off)' if not ALLOW_A_TRADES else ''}\n"
-        f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h | Fenêtre: {PRICE_WINDOW}\n"
-        f"Quotes dyn: {','.join(sorted(ALLOWED_QUOTES))} | Whitelist fixe: {len(FIXED_TOKENS)} | dyn: {len(DYNAMIC_TOKENS)} | tokenmap: {len(TOKEN_MAP)}\n"
-        f"Protocols: {','.join(sorted(ALLOWED_PROTOCOLS))}\n"
+        f"Max {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: {A_SIZE_PCT_ENV or '15%'}{' (off)' if not ALLOW_A_TRADES else ''}
+"
+        f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h | Fenêtre: {PRICE_WINDOW}
+"
+        f"Quotes dyn: {','.join(sorted(ALLOWED_QUOTES))} | Whitelist fixe: {len(FIXED_TOKENS)} | dyn: {len(DYNAMIC_TOKENS)} | tokenmap: {len(TOKEN_MAP)}
+"
+        f"Protocols: {','.join(sorted(ALLOWED_PROTOCOLS))}
+"
     )
     send(msg)
 
@@ -899,10 +924,12 @@ def daily_summary():
             ep = p.get('entry_price_sol') or 0.0
             pk = p.get('peak_price_sol') or 0.0
             lines.append(f"- {p['symbol']} [{p.get('score','?')}] | entry {ep:.6f} SOL | peak {pk:.6f} SOL")
-        body = "\n".join(lines)
+        body = "
+".join(lines)
     else:
         body = "Aucune position ouverte."
-    send(f"📰 Résumé quotidien {now_str()}\n{body}")
+    send(f"📰 Résumé quotidien {now_str()}
+{body}")
 
 # ======================
 # Telegram commandes
@@ -927,7 +954,9 @@ def handle_command(text: str, chat_id: str = None):
             q2 = jup_quote(USDC, WSOL, int(float(q.get("outAmount","0"))*0.98), min(SLIPPAGE_BPS, 50))
             if not q2 or not route_is_whitelisted(q2): send("🔍 TestTrade SELL: route non whitelist ou quote vide"); return
             sig2 = sign_and_send(jup_swap_tx(q2, str(kp.public_key)))
-            send(f"✅ TestTrade OK\nBuy Tx: {sig1}\nSell Tx: {sig2}")
+            send(f"✅ TestTrade OK
+Buy Tx: {sig1}
+Sell Tx: {sig2}")
         except Exception as e:
             send(f"❌ TestTrade error: {e}")
     elif tl.startswith("/refresh_tokens"):
@@ -955,7 +984,9 @@ def handle_command(text: str, chat_id: str = None):
                 if not q or not route_is_whitelisted(q):
                     send("Route non whitelistée pour /forcebuy"); return
                 sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-                send(f"🚨 FORCE BUY {sym} ({mint})\nMontant: {size_sol:.4f} SOL\nTx: {sig}")
+                send(f"🚨 FORCE BUY {sym} ({mint})
+Montant: {size_sol:.4f} SOL
+Tx: {sig}")
             else:
                 send("Sonde anti-honeypot KO — /forcebuy annulé.")
         except Exception as e:
@@ -1014,13 +1045,19 @@ def poll_telegram():
 def boot_message():
     b = get_balance_sol()
     send(
-        f"[{BOT_VERSION}] 🚀 Bot prêt ✅\n"
+        f"[{BOT_VERSION}] 🚀 Bot prêt ✅
+"
         f"Seuil: {int(ENTRY_THRESHOLD*100)}% | SL: -{int(STOP_LOSS_PCT*100)}% | "
-        f"Trailing: +{int(TRAILING_TRIGGER_PCT*100)}% / -{int(TRAILING_THROWBACK_PCT*100)}%\n"
-        f"Max trades: {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: {A_SIZE_PCT_ENV or '15%'}{' (off)' if not ALLOW_A_TRADES else ''}\n"
-        f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h | Fenêtre: {PRICE_WINDOW}\n"
-        f"DRY_RUN: {DRY_RUN} | PROBE: {PROBE_ENABLED} ({PROBE_SOL} SOL)\n"
-        f"Quotes dyn: {','.join(sorted(ALLOWED_QUOTES))} | Whitelist fixe: {len(FIXED_TOKENS)} | dynamique max: {DYNAMIC_MAX_TOKENS}\n"
+        f"Trailing: +{int(TRAILING_TRIGGER_PCT*100)}% / -{int(TRAILING_THROWBACK_PCT*100)}%
+"
+        f"Max trades: {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: {A_SIZE_PCT_ENV or '15%'}{' (off)' if not ALLOW_A_TRADES else ''}
+"
+        f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h | Fenêtre: {PRICE_WINDOW}
+"
+        f"DRY_RUN: {DRY_RUN} | PROBE: {PROBE_ENABLED} ({PROBE_SOL} SOL)
+"
+        f"Quotes dyn: {','.join(sorted(ALLOWED_QUOTES))} | Whitelist fixe: {len(FIXED_TOKENS)} | dynamique max: {DYNAMIC_MAX_TOKENS}
+"
         f"Protocols: {','.join(sorted(ALLOWED_PROTOCOLS))}"
     )
 
@@ -1029,3 +1066,36 @@ def boot_message():
 # =====================
 
 def main():
+    load_positions()
+    load_blacklist()
+    load_dynamic_tokens()
+    load_token_map()
+
+    boot_message()
+    refresh_token_map()
+    refresh_dynamic_tokens()
+    send_boot_diagnostics()
+
+    scheduler = BackgroundScheduler(timezone=TZ)
+    scheduler.add_job(scan_market, "interval", seconds=SCAN_INTERVAL_SEC, id="scan")
+    scheduler.add_job(heartbeat, "interval", minutes=HEARTBEAT_MINUTES, id="heartbeat")
+    scheduler.add_job(daily_summary, "cron", hour=21, minute=0, id="daily_summary")
+    scheduler.add_job(poll_telegram, "interval", seconds=15, id="tg_poll")
+    scheduler.add_job(refresh_dynamic_tokens, "interval", minutes=10, id="dyn_refresh")
+    scheduler.add_job(refresh_token_map, "interval", minutes=30, id="map_refresh")
+    scheduler.start()
+
+    running = True
+    import signal
+    def _stop(*_):
+        nonlocal running; running = False
+    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
+
+    try:
+        while running:
+            time.sleep(1)
+    finally:
+        scheduler.shutdown(); print("[exit] bye")
+
+if __name__ == "__main__":
+    main()
