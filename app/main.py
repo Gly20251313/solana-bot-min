@@ -791,8 +791,8 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         if not q or not route_is_whitelisted(q):
             send(f"⛔ Route non whitelist à la vente pour {symbol} — tentative annulée"); return False
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send(f"{reason} {symbol}
-Tx: {sig}")
+        send(f""" {reason} {symbol}
+Tx: {sig}""")
         return True
     except Exception as e:
         send(f"❌ Vente {symbol} échouée: {e}"); return False
