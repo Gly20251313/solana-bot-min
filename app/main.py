@@ -99,7 +99,6 @@ JUP_TOKEN_LIST = "https://token.jup.ag/all"
 
 # DexScreener
 DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"     # ?q=solana
-DEX_PAIRS_SOLANA    = "https://api.dexscreener.com/latest/dex/pairs/solana"
 DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"      # + /{mint}
 
 # Quotes autorisées (configurable via ENV)
@@ -348,27 +347,41 @@ def get_sol_usd() -> float:
         return 150.0
 
 def fetch_pairs() -> list:
-    """Récupère un large set de paires Solana. Tente /pairs/solana puis fallback /search."""
-    # 1) Endpoint dédié à la chaîne (souvent plus riche)
+    """Récupère des paires Solana en agrégeant plusieurs requêtes de recherche et un fallback 'boosts'."""
+    results = []
+    seen = set()
+    # 1) Agrégation par requêtes de recherche (limitées à ~30 chacune)
+    queries = list(sorted(ALLOWED_QUOTES)) + ["SOLANA", "RAYDIUM", "ORCA"]
+    for q in queries:
+        try:
+            r = http_get(DEX_SCREENER_SEARCH, params={"q": q}, timeout=15)
+            data = r.json() or {}
+            for p in (data.get("pairs") or []) or []:
+                if (p.get("chainId") or "").lower() != "solana":
+                    continue
+                pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                results.append(p)
+        except Exception as e:
+            logger.debug(f"fetch_pairs search '{q}' failed: {e}")
+    # 2) Fallback via tokens boostés → récupération des paires par adresse de token
     try:
-        r = http_get(DEX_PAIRS_SOLANA, timeout=20)
-        data = r.json() or {}
-        pairs = data.get("pairs", []) or data or []
-        pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
-        if pairs:
-            return pairs
-    except Exception as e:
-        logger.debug(f"fetch_pairs primary failed: {e}")
-    # 2) Fallback search
-    try:
-        r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
-        data = r.json() or {}
-        pairs = data.get("pairs", []) or []
-        return [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
-    except Exception as e:
-        logger.warning(f"fetch_pairs error: {e}")
-        return []
-
+        r = http_get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=10)
+        boosts = [b for b in (r.json() or []) if (b.get("chainId") or "").lower() == "solana"]
+        addrs = [b.get("tokenAddress") for b in boosts if b.get("tokenAddress")]
+        for i in range(0, len(addrs), 30):
+            batch = ",".join(addrs[i:i+30])
+            if not batch:
+                continue
+            try:
+                rr = http_get(f"https://api.dexscreener.com/tokens/v1/solana/{batch}", timeout=15)
+                arr = rr.json() or []
+                for info in arr:
+                    if (info.get("chainId") or "").lower() != "solana":
+                        continue
+                    pid = info.get("pairAddress") or ((info.get("baseToken") or {}).get("add
 def get_price_change_pct(pair: dict, window: str) -> float:
     pc = pair.get("priceChange", {})
     val = pc.get(window)
@@ -1027,4 +1040,3 @@ def main():
         scheduler.shutdown(); print("[exit] bye")
 
 if __name__ == "__main__":
-    main()
