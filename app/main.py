@@ -967,7 +967,7 @@ def handle_command(text: str, chat_id: str = None):
                 if not q or not ok_route:
                     send("Route non whitelistée pour /forcebuy | labels="+", ".join([l for l in labels if l])); return
                 sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
-                send("🚨 FORCE BUY "+sym+" ("+mint+")\nMontant: "+f\"{size_sol:.4f}\"+" SOL\nTx: "+str(sig))
+                send(f"🚨 FORCE BUY {sym} ({mint})\nMontant: {size_sol:.4f} SOL\nTx: {sig}")
             else:
                 send("Sonde anti-honeypot KO — /forcebuy annulé.")
         except Exception as e:
