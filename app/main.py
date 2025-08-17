@@ -566,7 +566,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     lamports = int(size_sol * 1_000_000_000)
     if lamports <= 0:
         send("❌ Achat annulé: solde SOL insuffisant"); return
-     trade_id = new_trade_id()
+    trade_id = new_trade_id()
     _probe = probe_trade(base_mint, str(kp.public_key))
     if _probe is False:
         blacklist(base_mint, hours=24)
@@ -585,6 +585,8 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
             send("🧪 Sonde: route non whitelist → skip (pas de blacklist)")
             return
             
+    except Exception as e:
+        send("❌ Sonde exception: " + str(e)); return
         q = jup_quote(WSOL, base_mint, lamports, SLIPPAGE_BPS)
         ok_route, labels = route_is_whitelisted(q, return_labels=True)
         if not q or not ok_route:
@@ -593,9 +595,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         if pi is not None:
             send("⛔ Price impact " + f"{pi:.2f}" + "% > cap " + str(MAX_PRICE_IMPACT_PCT) + "% → skip"); return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send(
-
-
+        send("📈 Achat " + base_sym + " [" + score + "]\nMontant: " + f"{size_sol:.4f}" + " SOL\nPair: " + pair_url + "\nID: " + trade_id + "\nTx: " + str(sig))
 
 def size_for_score(balance_sol: float, score: str) -> float:
     if score == "A+":
@@ -675,12 +675,11 @@ def refresh_dynamic_tokens():
 
         DYNAMIC_TOKENS = found
         save_dynamic_tokens()
-        send("✅ dynamic=" + str(len(DYNAMIC_TOKENS)) + " (rejets liq=" + str(rej_liq) + ", vol=" + str(rej_vol) + ", age=" + str(rej_age) + ", quote=" + str(rej_quote) + ")")
+        send("✅ dynamic=" + str(len(DYNAMIC_TOKENS)) + " (rejets liq=" + str(rej_liq) + ", vol=" + str(rej_vol) + ", age=" + str(rej_age) + ", quote=" + str(rej_quote) + ", dupe=" + str(rej_dupe) + ")")
         return DYNAMIC_TOKENS
     except Exception as e:
         send("⚠️ dynamic=0 (erreur: " + str(e) + ")")
         return set()
-"📈 Achat " + base_sym + " [" + score + "]\nMontant: " + f"{size_sol:.4f}" + " SOL\nPair: " + pair_url + "\nID: " + trade_id + "\nTx: " + str(sig))
     except Exception as e:
         send("❌ Achat " + base_sym + " échoué: " + str(e)); return
     price_sol = pair_price_in_sol(pair, sol_usd)
