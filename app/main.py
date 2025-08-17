@@ -23,7 +23,7 @@ from solana.rpc.types import TxOpts
 # ======================
 # Version & ENV
 # ======================
-BOT_VERSION = os.getenv("BOT_VERSION", "v2.0-aug-2025")
+BOT_VERSION = os.getenv("BOT_VERSION", "v2.1-dynslip-2025-08-17")
 
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -41,7 +41,7 @@ MAX_OPEN_TRADES          = int(os.getenv("MAX_OPEN_TRADES", "4"))
 
 SCAN_INTERVAL_SEC        = int(os.getenv("SCAN_INTERVAL_SEC", "30"))
 SLIPPAGE_BPS             = int(os.getenv("SLIPPAGE_BPS", "100"))
-MAX_SLIPPAGE_BPS         = int(os.getenv("MAX_SLIPPAGE_BPS", "150"))
+MAX_SLIPPAGE_BPS         = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))  # un peu plus large pour retry
 MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 
@@ -51,10 +51,10 @@ PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
 PROBE_SELL_FACTOR        = float(os.getenv("PROBE_SELL_FACTOR", "0.95"))
 
 # New: USD-based liquidity threshold (takes precedence if >0)
-MIN_LIQ_USD              = float(os.getenv("MIN_LIQ_USD", "20000"))  # requested default
+MIN_LIQ_USD              = float(os.getenv("MIN_LIQ_USD", "20000"))  # élargi comme demandé
 MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "1.0"))     # used only if MIN_LIQ_USD<=0
 MIN_VOL_SOL              = float(os.getenv("MIN_VOL_SOL", "0.5"))
-MIN_POOL_AGE_SEC         = int(os.getenv("MIN_POOL_AGE_SEC", "600"))  # recommended ≥ 600 for safety
+MIN_POOL_AGE_SEC         = int(os.getenv("MIN_POOL_AGE_SEC", "600"))  # recommandé ≥ 600 pour éviter les brand new
 DYNAMIC_MAX_TOKENS       = int(os.getenv("DYNAMIC_MAX_TOKENS", "200"))
 DYN_IGNORE_FILTERS       = os.getenv("DYN_IGNORE_FILTERS", "0") == "1"
 MAX_PER_QUOTE            = int(os.getenv("MAX_PER_QUOTE", "12"))
@@ -99,7 +99,10 @@ ALLOWED_QUOTES: Set[str] = {
     ).split(",") if q.strip()
 }
 ALLOWED_PROTOCOLS = {"Raydium", "Orca", "Phoenix", "OpenBook", "Serum", "Meteora", "Lifinity"}
-EXTRA_PROTOCOLS = os.getenv("ALLOWED_PROTOCOLS_EXTRA", "Whirlpool,CLMM,CPMM,DLMM")
+EXTRA_PROTOCOLS = os.getenv(
+    "ALLOWED_PROTOCOLS_EXTRA",
+    "Whirlpool,CLMM,CPMM,DLMM,Pump.fun,OpenBook,Serum,Meteora,Lifinity,Phoenix,GooseFX,Crema,Invariant,Saros,Step,Raydium AMM"
+)
 if EXTRA_PROTOCOLS:
     ALLOWED_PROTOCOLS |= {p.strip() for p in EXTRA_PROTOCOLS.split(",") if p.strip()}
 
@@ -153,7 +156,7 @@ def http_get(url, params=None, timeout=15):
     r.raise_for_status()
     return r
 
-def http_post(url, json_payload=None, timeout=20):
+def http_post(url, json_payload=None, timeout=25):
     r = requests.post(url, json=json_payload, timeout=timeout)
     r.raise_for_status()
     return r
@@ -415,7 +418,7 @@ def rank_candidates(pairs: list, sol_usd: float) -> list:
     return sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
 
 # ======================
-# Jupiter
+# Whitelist patterns
 # ======================
 def _build_allowed_patterns():
     pats = set()
@@ -427,7 +430,7 @@ def _build_allowed_patterns():
         if s == "orca":
             pats.update(["whirlpool"])
         if s == "raydium":
-            pats.update(["raydium clmm", "raydium cpmm"])
+            pats.update(["raydium clmm", "raydium cpmm", "raydium amm"])
         if s in ("openbook", "serum", "phoenix"):
             pats.update(["openbook", "serum", "phoenix"])
         if s == "lifinity":
@@ -436,6 +439,8 @@ def _build_allowed_patterns():
             pats.update(["meteora", "dlmm"])
         if s == "pump.fun":
             pats.update(["pump.fun", "amm"])
+        # divers
+        pats.update(["cpmm", "clmm", "dlmm"])
     return pats
 
 _ALLOWED_PATTERNS = _build_allowed_patterns()
@@ -457,11 +462,14 @@ def route_is_whitelisted(quote: dict, return_labels: bool = False):
         return (False, labels) if return_labels else False
     if unknowns and WHITELIST_MODE == "permissive":
         try:
-            send("⚠️ Protocole(s) non-whitelist tolérés: " + ", ".join(unknowns))
+            send("⚠️ Protocole(s) tolérés hors whitelist stricte: " + ", ".join([u for u in unknowns if u]))
         except Exception:
             pass
     return (True, labels) if return_labels else True
 
+# ======================
+# Jupiter (quotes & swaps)
+# ======================
 def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippage_bps: int):
     params = {
         "inputMint": input_mint,
@@ -474,14 +482,19 @@ def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippa
     r = http_get(JUP_QUOTE_URL, params=params, timeout=15)
     return r.json()
 
-def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True):
+def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True, use_dynamic: bool = True):
     payload = {
         "quoteResponse": quote_resp,
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": wrap_unwrap_sol,
-        "asLegacyTransaction": True,
+        "asLegacyTransaction": True,  # reste en Legacy (on signe via Transaction.deserialize)
     }
-    r = http_post(JUP_SWAP_URL, json_payload=payload, timeout=20)
+    if use_dynamic:
+        payload["dynamicSlippage"] = {"minBps": 50, "maxBps": MAX_SLIPPAGE_BPS}
+        payload["prioritizationFeeLamports"] = "auto"
+        payload["dynamicComputeUnitLimit"] = True
+
+    r = http_post(JUP_SWAP_URL, json_payload=payload, timeout=25)
     data = r.json()
     return data["swapTransaction"]
 
@@ -496,6 +509,11 @@ def sign_and_send(serialized_b64: str):
         opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed")
     )
     return resp.get("result", resp) if isinstance(resp, dict) else resp
+
+def _is_jup_slippage_err(err: Exception) -> bool:
+    s = str(err)
+    # 0x1771=6001 (SlippageToleranceExceeded), 6017 (ExactOutAmountNotMatched), 0x1789=6025 (famille similaire)
+    return ("0x1771" in s) or ("6001" in s) or ("6017" in s) or ("0x1789" in s) or ("6025" in s)
 
 # ======================
 # Wallet / SPL
@@ -606,22 +624,50 @@ def probe_trade(mint: str, user_pubkey: str):
         return True
     try:
         lamports = max(1, int(PROBE_SOL * 1_000_000_000))
+
+        # BUY quote + labels
         q_buy  = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
         if not q_buy:
             send("🧪 probe: BUY quote vide"); return None
-        if not route_is_whitelisted(q_buy):
-            send("🧪 probe: BUY route non whitelistée"); return None
+        ok_buy, buy_labels = route_is_whitelisted(q_buy, return_labels=True)
+        if not ok_buy:
+            send("🧪 probe: BUY non whitelist | labels=" + ", ".join([l for l in buy_labels if l])); return None
 
+        # SELL quote + labels
         q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
         if not q_sell:
             send("🧪 probe: SELL quote vide"); return None
-        if not route_is_whitelisted(q_sell):
-            send("🧪 probe: SELL route non whitelistée"); return None
+        ok_sell, sell_labels = route_is_whitelisted(q_sell, return_labels=True)
+        if not ok_sell:
+            send("🧪 probe: SELL non whitelist | labels=" + ", ".join([l for l in sell_labels if l])); return None
 
         if DRY_RUN:
             return True
-        _ = sign_and_send(jup_swap_tx(q_buy, user_pubkey))
-        _ = sign_and_send(jup_swap_tx(q_sell, user_pubkey))
+
+        # --- BUY with dynamic slippage + retry if slippage-like error ---
+        try:
+            txb64 = jup_swap_tx(q_buy, user_pubkey, use_dynamic=True)
+            _ = sign_and_send(txb64)
+        except Exception as e:
+            if _is_jup_slippage_err(e):
+                q_buy = jup_quote(WSOL, mint, lamports, min(PROBE_SLIPPAGE_BPS * 2, MAX_SLIPPAGE_BPS))
+                txb64 = jup_swap_tx(q_buy, user_pubkey, use_dynamic=True)
+                _ = sign_and_send(txb64)
+            else:
+                raise
+
+        # --- SELL with dynamic slippage + retry ---
+        try:
+            txb64 = jup_swap_tx(q_sell, user_pubkey, use_dynamic=True)
+            _ = sign_and_send(txb64)
+        except Exception as e:
+            if _is_jup_slippage_err(e):
+                q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), min(PROBE_SLIPPAGE_BPS * 2, MAX_SLIPPAGE_BPS))
+                txb64 = jup_swap_tx(q_sell, user_pubkey, use_dynamic=True)
+                _ = sign_and_send(txb64)
+            else:
+                raise
+
         return True
     except Exception as e:
         logger.warning("probe_trade: " + str(e))
@@ -767,7 +813,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         q = jup_quote(WSOL, base_mint, lamports, SLIPPAGE_BPS)
         if not q or not route_is_whitelisted(q):
             send("⛔ Route non whitelist pour " + base_sym + " — rejet"); return
-        sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
+        sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
         send("📈 Achat " + base_sym + " [" + score + "]\nMontant: " + f"{size_sol:.4f}" + " SOL\nPair: " + pair_url + "\nID: " + trade_id + "\nTx: " + str(sig))
     except Exception as e:
         send("❌ Achat " + base_sym + " échoué: " + str(e)); return
@@ -792,7 +838,7 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         q = jup_quote(mint, WSOL, int(bal_amount * 0.99), SLIPPAGE_BPS)
         if not q or not route_is_whitelisted(q):
             send("⛔ Route non whitelist à la vente pour " + symbol + " — tentative annulée"); return False
-        sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
+        sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
         send(reason + " " + symbol + "\nTx: " + str(sig))
         return True
     except Exception as e:
@@ -953,10 +999,10 @@ def handle_command(text: str, chat_id: str = None):
             amt = max(0.002, PROBE_SOL); lamports = int(amt * 1_000_000_000)
             q = jup_quote(WSOL, USDC, lamports, min(SLIPPAGE_BPS, 50))
             if not q or not route_is_whitelisted(q): send("🔍 TestTrade: route non whitelist ou quote vide"); return
-            sig1 = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
+            sig1 = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
             q2 = jup_quote(USDC, WSOL, int(float(q.get("outAmount","0"))*0.98), min(SLIPPAGE_BPS, 50))
             if not q2 or not route_is_whitelisted(q2): send("🔍 TestTrade SELL: route non whitelist ou quote vide"); return
-            sig2 = sign_and_send(jup_swap_tx(q2, str(kp.public_key)))
+            sig2 = sign_and_send(jup_swap_tx(q2, str(kp.public_key), use_dynamic=True))
             send("✅ TestTrade OK\nBuy Tx: " + str(sig1) + "\nSell Tx: " + str(sig2))
         except Exception as e:
             send("❌ TestTrade error: " + str(e))
@@ -979,7 +1025,7 @@ def handle_command(text: str, chat_id: str = None):
                 q = jup_quote(WSOL, mint, lamports, SLIPPAGE_BPS)
                 if not q or not route_is_whitelisted(q):
                     send("Route non whitelistée pour /forcebuy"); return
-                sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
+                sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
                 send("🚨 FORCE BUY " + sym + " (" + mint + ")\nMontant: " + f"{size_sol:.4f}" + " SOL\nTx: " + str(sig))
             else:
                 send("Sonde anti-honeypot KO — /forcebuy annulé.")
