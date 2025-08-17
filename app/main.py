@@ -20,6 +20,7 @@ TZ_NAME = os.getenv("TZ", "Europe/Paris")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
 ENTRY_THRESHOLD          = float(os.getenv("ENTRY_THRESHOLD", "0.02"))
+WHITELIST_MODE = os.getenv("WHITELIST_MODE", "strict").strip().lower()  # "strict" ou "permissive"
 PRICE_WINDOW             = os.getenv("PRICE_WINDOW", "m5")
 POSITION_SIZE_PCT        = float(os.getenv("POSITION_SIZE_PCT", "0.25"))
 A_SIZE_PCT_ENV           = os.getenv("A_SIZE_PCT", "0.15")
@@ -343,6 +344,9 @@ def rank_candidates(pairs: list, sol_usd: float) -> list:
     return sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
 
 
+
+
+
 def _build_allowed_patterns():
     pats = set()
     for p in ALLOWED_PROTOCOLS:
@@ -354,17 +358,40 @@ def _build_allowed_patterns():
             pats.update(["whirlpool"])
         if s == "raydium":
             pats.update(["raydium clmm", "raydium cpmm"])
-        if s in ("openbook", "serum"):
-            pats.update(["openbook", "serum"])
+        if s in ("openbook", "serum", "phoenix"):
+            pats.update(["openbook", "serum", "phoenix"])
+        if s == "lifinity":
+            pats.update(["lifinity"])
         if s == "meteora":
             pats.update(["meteora", "dlmm"])
         if s == "pump.fun":
             pats.update(["pump.fun", "amm"])
     return pats
 
-
 _ALLOWED_PATTERNS = _build_allowed_patterns()
+
 def route_is_whitelisted(quote: dict, return_labels: bool = False):
+    rp = quote.get("routePlan") or quote.get("marketInfos") or []
+    labels = []
+    if not isinstance(rp, list):
+        return (False, labels) if return_labels else False
+    unknowns = []
+    for step in rp:
+        info = step.get("swapInfo") or step
+        label = (info.get("label") or info.get("protocol") or "").strip()
+        labels.append(label)
+        lbl = label.lower()
+        if not any(pat in lbl for pat in _ALLOWED_PATTERNS):
+            unknowns.append(label)
+    if unknowns and WHITELIST_MODE == "strict":
+        return (False, labels) if return_labels else False
+    if unknowns and WHITELIST_MODE == "permissive":
+        try:
+            send("⚠️ Protocole(s) non-whitelist: " + ", ".join(unknowns))
+        except Exception:
+            pass
+    return (True, labels) if return_labels else True
+
 
 def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippage_bps: int):
     params = {
@@ -490,26 +517,24 @@ def blacklist(mint: str, hours=24):
     save_blacklist()
 
 
+
 def probe_trade(mint: str, user_pubkey: str):
-    """Retourne True (ok), False (échec dur), ou None (soft-skip: route non whitelist, quote vide, DRY_RUN)."""
     if not PROBE_ENABLED:
         return True
     try:
         lamports = max(1, int(PROBE_SOL * 1_000_000_000))
-        # BUY
-        q_buy = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
+        q_buy  = jup_quote(WSOL, mint, lamports, PROBE_SLIPPAGE_BPS)
         if not q_buy:
             send("🧪 probe: BUY quote vide"); return None
-        ok_buy = route_is_whitelisted(q_buy)
-        if not ok_buy:
+        if not route_is_whitelisted(q_buy):
             send("🧪 probe: BUY route non whitelistée"); return None
-        # SELL
+
         q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), PROBE_SLIPPAGE_BPS)
         if not q_sell:
             send("🧪 probe: SELL quote vide"); return None
-        ok_sell = route_is_whitelisted(q_sell)
-        if not ok_sell:
+        if not route_is_whitelisted(q_sell):
             send("🧪 probe: SELL route non whitelistée"); return None
+
         if DRY_RUN:
             return True
         _ = sign_and_send(jup_swap_tx(q_buy, user_pubkey))
@@ -518,7 +543,6 @@ def probe_trade(mint: str, user_pubkey: str):
     except Exception as e:
         logger.warning("probe_trade: " + str(e))
         return False
-
 
 def final_whitelist() -> Set[str]:
     fixed = {WSOL, USDC,
@@ -543,6 +567,11 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     if lamports <= 0:
         send("❌ Achat annulé: solde SOL insuffisant"); return
     trade_id = new_trade_id()
+        _probe = probe_trade(base_mint, str(kp.public_key))
+        if _probe is False:
+            blacklist(base_mint, hours=24); send('🧪 Sonde KO → blacklist 24h : ' + base_mint); return
+        elif _probe is not True:
+            return
     try:
         probe_res = probe_trade(base_mint, str(kp.public_key))
         if probe_res is False:
