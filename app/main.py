@@ -1,21 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 Solana Pump-Scanner + Trader (DexScreener + Jupiter Lite)
-- Whitelist fixe (mints connus) + liste dynamique (top volume/liquidité, côté SOL/USDC)
-- Résolution robuste symboles -> mints (Jupiter token list + fallback DexScreener)
-- Filtres sécurité (liquidité/volume/âge), routes Jupiter whitelistees, micro-sonde anti-honeypot
-- Risk: SL dur, Trailing TP, taille par score (A+ / A)
-- Telegram: /start /stop /status /testtrade /refresh_tokens
-- DRY_RUN pour tester sans envoyer
+Version blindée (robuste) — 2025-08-17
+- Whitelist fixe + dynamique (quotes configurables par ENV)
+- Résolution symbole->mint (Jupiter token list + fallback DexScreener)
+- Filtres sécurité (liq/vol/âge), route Jupiter whitelistee, micro-sonde anti-honeypot (optionnelle)
+- Risk: SL dur, Trailing TP, sizing A+/A (A lisible via ENV)
+- Telegram: /start /stop /status /testtrade /refresh_tokens /dyninfo /forcebuy /reset_offset /whoami /version
+- Diagnostics dyn (compteurs rejets), logs plus verbeux en DEBUG
+- Endpoints DexScreener: pairs/solana (fallback search)
+
+Dépendances (versions conseillées):
+  requests, based58==2.1.1, pytz, apscheduler, solana==0.25.0
 """
 
-import os, time, json, base64, math, tempfile, shutil, logging, uuid, re
+import os, time, json, base64, math, uuid, re, logging
+from typing import Dict, Any, Set, Tuple
+from datetime import datetime
+
 import requests
 import based58  # pip install base58==2.1.1
 import pytz
-from datetime import datetime
-from typing import Dict, Any, Set, Tuple
-
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # Solana stack (versions stables pour Python 3.12)
@@ -25,19 +30,22 @@ from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
 
 # =========================
-# ENV & Réglages
+# Version & ENV
 # =========================
+BOT_VERSION = os.getenv("BOT_VERSION", "v1.2-bulwark-2025-08-17")
+
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
+CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")  # peut être négatif (groupes)
 TZ_NAME = os.getenv("TZ", "Europe/Paris")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
 # Signal de pump
-ENTRY_THRESHOLD          = float(os.getenv("ENTRY_THRESHOLD", "0.70"))   # 70%
+ENTRY_THRESHOLD          = float(os.getenv("ENTRY_THRESHOLD", "0.70"))   # 70% par défaut
 PRICE_WINDOW             = os.getenv("PRICE_WINDOW", "h1")               # m5|h1|h6|h24
 
 # Sizing & risque
 POSITION_SIZE_PCT        = float(os.getenv("POSITION_SIZE_PCT", "0.25")) # A+ = 25%
+A_SIZE_PCT_ENV           = os.getenv("A_SIZE_PCT")                         # optionnel (str)
 STOP_LOSS_PCT            = float(os.getenv("STOP_LOSS_PCT", "0.10"))     # -10%
 TRAILING_TRIGGER_PCT     = float(os.getenv("TRAILING_TRIGGER_PCT", "0.30"))  # +30%
 TRAILING_THROWBACK_PCT   = float(os.getenv("TRAILING_THROWBACK_PCT", "0.20")) # -20% du plus haut
@@ -58,6 +66,8 @@ PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.003"))        # micro
 MIN_LIQ_SOL              = float(os.getenv("MIN_LIQ_SOL", "10.0"))
 MIN_VOL_SOL              = float(os.getenv("MIN_VOL_SOL", "5.0"))
 MIN_POOL_AGE_SEC         = int(os.getenv("MIN_POOL_AGE_SEC", str(2*60*60)))  # 2h
+DYNAMIC_MAX_TOKENS       = int(os.getenv("DYNAMIC_MAX_TOKENS", "50"))
+DYN_IGNORE_FILTERS       = os.getenv("DYN_IGNORE_FILTERS", "0") == "1"  # diag only
 
 # A-trades facultatifs (par défaut OFF -> on ne trade que A+)
 ALLOW_A_TRADES           = os.getenv("ALLOW_A_TRADES", "0") == "1"
@@ -68,9 +78,7 @@ POSITIONS_PATH           = os.getenv("POSITIONS_PATH", "./positions.json")
 BLACKLIST_PATH           = os.getenv("BLACKLIST_PATH", "./blacklist.json")
 DYN_CACHE_PATH           = os.getenv("DYN_CACHE_PATH", "./dynamic_tokens.json")
 TOKENMAP_CACHE_PATH      = os.getenv("TOKENMAP_CACHE_PATH", "./token_map.json")
-
-# Whitelist dynamique cible
-DYNAMIC_MAX_TOKENS       = int(os.getenv("DYNAMIC_MAX_TOKENS", "50"))
+TG_OFFSET_PATH           = os.getenv("TELEGRAM_OFFSET_PATH", "./tg_offset.json")
 
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -84,33 +92,49 @@ USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # Jupiter Lite
 JUP_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
 JUP_SWAP_URL  = "https://lite-api.jup.ag/swap/v1/swap"
-PRICE_API     = f"https://lite-api.jup.ag/price/v3?ids={WSOL}"  # lit usdPrice de WSOL
+PRICE_API     = f"https://lite-api.jup.ag/price/v3?ids={WSOL}"
 
-# Jupiter token list (très utile pour map symbol->mint)
-JUP_TOKEN_LIST = "https://token.jup.ag/all"  # renvoie liste complète {mint:{symbol, name, decimals,...}}
+# Jupiter token list (map symbol -> mint)
+JUP_TOKEN_LIST = "https://token.jup.ag/all"
 
 # DexScreener
 DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"     # ?q=solana
 DEX_PAIRS_SOLANA    = "https://api.dexscreener.com/latest/dex/pairs/solana"
 DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"      # + /{mint}
 
-# Quotes autorisées pour la whitelist dynamique (configurable via Railway)
+# Quotes autorisées (configurable via ENV)
 ALLOWED_QUOTES = {
     q.strip().upper()
-    for q in os.getenv("ALLOWED_QUOTES", "SOL,WSOL,USDC").split(",")
+    for q in os.getenv("ALLOWED_QUOTES", "SOL,WSOL,USDC,USDT").split(",")
     if q.strip()
 }
 
-
 # Whitelist de protocoles pour routes Jupiter
 ALLOWED_PROTOCOLS = {"Raydium", "Orca", "Phoenix", "Lifinity"}
+EXTRA_PROTOCOLS = os.getenv("ALLOWED_PROTOCOLS_EXTRA", "")
+if EXTRA_PROTOCOLS:
+    ALLOWED_PROTOCOLS |= {p.strip() for p in EXTRA_PROTOCOLS.split(",") if p.strip()}
 
 # ==========================
 # Telegram minimal (polling)
 # ==========================
+def _load_tg_offset() -> int:
+    try:
+        if os.path.exists(TG_OFFSET_PATH):
+            return int(json.load(open(TG_OFFSET_PATH)).get("offset", 0))
+    except Exception:
+        pass
+    return 0
+
+def _save_tg_offset(offset: int):
+    try:
+        json.dump({"offset": offset}, open(TG_OFFSET_PATH, "w"))
+    except Exception:
+        pass
+
 def send(msg: str):
     if not TOKEN or not CHAT:
-        logger.warning("Telegram non configuré")
+        logger.warning("Telegram non configuré (TOKEN/CHAT)")
         return
     try:
         requests.get(
@@ -121,19 +145,19 @@ def send(msg: str):
     except Exception as e:
         logger.error(f"telegram error: {e}")
 
-TELEGRAM_OFFSET_PATH = "./tg_offset.json"
-def _load_tg_offset() -> int:
+# Permet de répondre à un chat arbitraire (utile pour /whoami)
+def send_to(chat_id: str, msg: str):
+    if not TOKEN:
+        logger.warning("Telegram TOKEN non configuré")
+        return
     try:
-        if os.path.exists(TELEGRAM_OFFSET_PATH):
-            return int(json.load(open(TELEGRAM_OFFSET_PATH)).get("offset", 0))
-    except Exception:
-        pass
-    return 0
-def _save_tg_offset(offset: int):
-    try:
-        json.dump({"offset": offset}, open(TELEGRAM_OFFSET_PATH, "w"))
-    except Exception:
-        pass
+        requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            params={"chat_id": chat_id, "text": msg},
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"telegram send_to error: {e}")
 
 # ======= HTTP helpers =======
 def http_get(url, params=None, timeout=15, retries=3, backoff=0.6):
@@ -169,17 +193,19 @@ def load_keypair() -> Keypair:
     pk_str = os.getenv("SOLANA_PRIVATE_KEY") or os.getenv("SOL_PRIVATE_KEY") or ""
     if not pk_str:
         raise ValueError("Variable SOLANA_PRIVATE_KEY manquante")
-    # supporte b58 (64 bytes) ou JSON [..]
-    secret: bytes
+    # supporte b58 (32/64 bytes) ou JSON [..]
     if pk_str.strip().startswith("["):
         arr = json.loads(pk_str)
         secret = bytes(arr)
     else:
-        # b58decode de base58==2.1.1
         secret = based58.b58decode(pk_str.strip().encode("utf-8"))
-    if len(secret) != 64:
-        raise ValueError(f"Clé invalide: {len(secret)} octets — attendu 64")
-    kp = Keypair.from_secret_key(secret)
+    if len(secret) == 64:
+        kp = Keypair.from_secret_key(secret)
+    elif len(secret) == 32:
+        # seed 32 bytes
+        kp = Keypair.from_seed(secret)
+    else:
+        raise ValueError(f"Clé invalide: {len(secret)} octets — attendu 32 ou 64")
     logger.info(f"[boot] Public key: {kp.public_key}")
     return kp
 
@@ -191,17 +217,24 @@ TZ = pytz.timezone(TZ_NAME)
 positions: Dict[str, Dict[str, Any]] = {}
 BLACKLIST: Dict[str, float] = {}
 DYNAMIC_TOKENS: Set[str] = set()
-TOKEN_MAP: Dict[str, Dict[str, Any]] = {}  # mint -> data (incl. symbol), plus index inversé
+TOKEN_MAP: Dict[str, Dict[str, Any]] = {}
 SYMBOL_TO_MINT: Dict[str, str] = {}
 HALT_TRADING = False
 
+# ===== helpers persistance =====
+def now_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
 def atomic_write_json(path: str, data: dict):
-    d = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(d, exist_ok=True)
-    tmp_path = os.path.join(d, f".tmp_{uuid.uuid4().hex}.json")
-    with open(tmp_path, "w") as tmp:
-        json.dump(data, tmp, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+    try:
+        d = os.path.dirname(os.path.abspath(path)) or "."
+        os.makedirs(d, exist_ok=True)
+        tmp_path = os.path.join(d, f".tmp_{uuid.uuid4().hex}.json")
+        with open(tmp_path, "w") as tmp:
+            json.dump(data, tmp, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logger.warning(f"atomic_write_json: {e}")
 
 def save_positions():
     try:
@@ -273,7 +306,7 @@ def load_token_map():
         TOKEN_MAP, SYMBOL_TO_MINT = {}, {}
 
 # ===================
-# Whitelist fixe (40)
+# Whitelist fixe (exemples de bluechips + SOL/USDC)
 # ===================
 FIXED_TOKENS: Set[str] = {
     WSOL, USDC,
@@ -284,18 +317,14 @@ FIXED_TOKENS: Set[str] = {
     "orcaEGLhXZcJuz2o1qgTt1rYfM8nRAPdY6inZY3khQk",   # ORCA
     "mSoLzysDnAqFLQ9dLru6T3rzEdd3TvTjL2AcK8tq7M2",   # mSOL
     "7dHbWXmci3dT8Q2ZUr9z5r5j6CkhdV8kFVUMbiZyJHcN",  # stSOL
-    "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",  # BTC (soBTC)
+    "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",  # soBTC
     "7XS5r6X1o8Z1CazTAp3GEXLMaLLq5yRvCNr4AaVsgY1v",  # PYTH
-    "JEFFLEhKxuxMxDPZWS9Vyuk3F7S3w7Dnk3a1JpN96G2",  # JitoSOL (exemple)
-    "So11111111111111111111111111111111111111112",  # WSOL (dup safe)
-    # ... tu peux en ajouter ici si besoin
 }
 
 # ==================
-# Prix / DexScreener
+# Prix / DexScreener helpers
 # ==================
-def now_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 def get_sol_usd() -> float:
     try:
@@ -320,6 +349,7 @@ def get_sol_usd() -> float:
 
 def fetch_pairs() -> list:
     """Récupère un large set de paires Solana. Tente /pairs/solana puis fallback /search."""
+    # 1) Endpoint dédié à la chaîne (souvent plus riche)
     try:
         r = http_get(DEX_PAIRS_SOLANA, timeout=20)
         data = r.json() or {}
@@ -329,6 +359,7 @@ def fetch_pairs() -> list:
             return pairs
     except Exception as e:
         logger.debug(f"fetch_pairs primary failed: {e}")
+    # 2) Fallback search
     try:
         r = http_get(DEX_SCREENER_SEARCH, params={"q": "solana"}, timeout=20)
         data = r.json() or {}
@@ -380,6 +411,7 @@ def pair_age_sec(pair: dict) -> float:
     return 0.0
 
 # ========== Jupiter ==========
+
 def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippage_bps: int):
     params = {
         "inputMint": input_mint,
@@ -392,6 +424,7 @@ def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippa
     r = http_get(JUP_QUOTE_URL, params=params, timeout=15)
     return r.json()
 
+
 def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True):
     payload = {
         "quoteResponse": quote_resp,
@@ -403,6 +436,7 @@ def jup_swap_tx(quote_resp: dict, user_pubkey: str, wrap_unwrap_sol: bool = True
     data = r.json()
     return data["swapTransaction"]
 
+
 def route_is_whitelisted(quote: dict) -> bool:
     rp = quote.get("routePlan") or quote.get("marketInfos") or []
     if not isinstance(rp, list):
@@ -413,6 +447,7 @@ def route_is_whitelisted(quote: dict) -> bool:
         if not label or label not in ALLOWED_PROTOCOLS:
             return False
     return True
+
 
 def sign_and_send(serialized_b64: str):
     if DRY_RUN:
@@ -427,10 +462,16 @@ def sign_and_send(serialized_b64: str):
     return resp.get("result", resp) if isinstance(resp, dict) else resp
 
 # ============= Wallet & SPL =============
+
 def get_balance_sol() -> float:
-    resp = client.get_balance(kp.public_key)
-    lamports = (resp.get("result") or {}).get("value", 0)
-    return lamports / 1_000_000_000
+    try:
+        resp = client.get_balance(kp.public_key)
+        lamports = (resp.get("result") or {}).get("value", 0)
+        return lamports / 1_000_000_000
+    except Exception as e:
+        logger.warning(f"get_balance_sol error: {e}")
+        return 0.0
+
 
 def get_token_balance(mint: str) -> int:
     try:
@@ -451,18 +492,23 @@ def get_token_balance(mint: str) -> int:
         return 0
 
 # ===== Utils =====
+
 def open_positions_count() -> int:
     return len(positions)
+
 def can_open_more() -> bool:
     return open_positions_count() < MAX_OPEN_TRADES
+
 def new_trade_id() -> str:
     return uuid.uuid4().hex[:8]
+
 def ok(b: bool) -> str:
     return "✅" if b else "❌"
 
 # ==============================
 # Token map & résolution symboles
 # ==============================
+
 def refresh_token_map():
     """Charge la token list Jupiter et construit symbol -> mint + mint -> info."""
     global TOKEN_MAP, SYMBOL_TO_MINT
@@ -477,7 +523,6 @@ def refresh_token_map():
             if not mint or not symbol:
                 continue
             new_map[mint] = {"symbol": symbol, "decimals": t.get("decimals"), "name": t.get("name")}
-            # garde la 1ère occurrence du symbole si plusieurs
             if symbol not in sym_map:
                 sym_map[symbol] = mint
         TOKEN_MAP = new_map
@@ -487,21 +532,18 @@ def refresh_token_map():
     except Exception as e:
         logger.warning(f"refresh_token_map: {e}")
 
-MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 def resolve_symbol_or_mint(val: str) -> Tuple[str, str]:
     """Retourne (mint, symbol). Si `val` est déjà un mint, renvoie le mint et son symbole si connu."""
     s = val.strip()
     if MINT_RE.match(s):
-        # c'est un mint
         info = TOKEN_MAP.get(s) or {}
         return s, (info.get("symbol") or "?")
-    # sinon essaye par symbole
     sym = s.upper()
     mint = SYMBOL_TO_MINT.get(sym)
     if mint:
         return mint, sym
-    # fallback: DexScreener /search?q=symbol puis prend baseToken.address du meilleur match solana
+    # fallback DexScreener search
     try:
         r = http_get(DEX_SCREENER_SEARCH, params={"q": sym}, timeout=10)
         pairs = (r.json() or {}).get("pairs", []) or []
@@ -518,13 +560,16 @@ def resolve_symbol_or_mint(val: str) -> Tuple[str, str]:
 # =================
 # Blacklist & Sonde
 # =================
+
 def is_blacklisted(mint: str) -> bool:
     exp = BLACKLIST.get(mint, 0)
     return bool(exp and time.time() < exp)
 
+
 def blacklist(mint: str, hours=24):
     BLACKLIST[mint] = time.time() + hours*3600
     save_blacklist()
+
 
 def probe_trade(mint: str, user_pubkey: str) -> bool:
     if not PROBE_ENABLED:
@@ -549,6 +594,7 @@ def probe_trade(mint: str, user_pubkey: str) -> bool:
 # =================
 # Scoring & sizing
 # =================
+
 def score_pair(chg_pct: float, liq_usd: float, vol_usd: float, age_sec: float, min_liq_usd: float, min_vol_usd: float) -> str:
     if chg_pct < ENTRY_THRESHOLD * 100:  # DexS donne %
         return "B"
@@ -558,11 +604,12 @@ def score_pair(chg_pct: float, liq_usd: float, vol_usd: float, age_sec: float, m
     soft = (liq_usd >= 0.9*min_liq_usd) and (vol_usd >= min_vol_usd) and (age_sec >= 0.5*MIN_POOL_AGE_SEC)
     return "A" if soft else "B"
 
+
 def size_for_score(balance_sol: float, score: str) -> float:
     if score == "A+":
         pct = POSITION_SIZE_PCT
     elif score == "A" and ALLOW_A_TRADES:
-        pct = 0.15
+        pct = float(A_SIZE_PCT_ENV) if A_SIZE_PCT_ENV else 0.15
     else:
         return 0.0
     size_sol = max(balance_sol * pct, MIN_TRADE_SOL)
@@ -571,63 +618,79 @@ def size_for_score(balance_sol: float, score: str) -> float:
 # ==========================
 # Whitelist dynamique (DexS)
 # ==========================
+
 def refresh_dynamic_tokens():
-   def refresh_dynamic_tokens():
-    """Met à jour la whitelist dynamique à partir de DexScreener"""
+    """Met à jour la whitelist dynamique à partir de DexScreener, avec compteurs de rejets."""
     global DYNAMIC_TOKENS
     try:
+        sol_usd = get_sol_usd()
+        min_liq_usd = MIN_LIQ_SOL * sol_usd
+        min_vol_usd = MIN_VOL_SOL * sol_usd
+
         pairs = fetch_pairs()
+        if not pairs:
+            DYNAMIC_TOKENS = set()
+            save_dynamic_tokens()
+            logger.warning("[dynamic] fetch_pairs a renvoyé 0 paire")
+            send("⚠️ dynamic=0 (DexScreener vide)")
+            return
+
+        found = set()
+        rej_liq = rej_vol = rej_age = rej_quote = 0
+
+        pairs.sort(key=lambda p: pair_volume_h24_usd(p), reverse=True)
+        for p in pairs:
+            if len(found) >= DYNAMIC_MAX_TOKENS:
+                break
+            if (p.get("chainId") or "").lower() != "solana":
+                continue
+
+            base_mint = (p.get("baseToken") or {}).get("address")
+            if not base_mint:
+                continue
+
+            quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
+            if quote_sym not in ALLOWED_QUOTES:
+                rej_quote += 1
+                continue
+
+            if DYN_IGNORE_FILTERS:
+                found.add(base_mint)
+                continue
+
+            liq_usd = pair_liquidity_usd(p)
+            vol_usd = pair_volume_h24_usd(p)
+            age = pair_age_sec(p)
+
+            if liq_usd < min_liq_usd:
+                rej_liq += 1; continue
+            if vol_usd < min_vol_usd:
+                rej_vol += 1; continue
+            if age < MIN_POOL_AGE_SEC:
+                rej_age += 1; continue
+
+            found.add(base_mint)
+
+        DYNAMIC_TOKENS = found
+        save_dynamic_tokens()
+        logger.info(
+            f"[dynamic] rafraîchi: {len(DYNAMIC_TOKENS)} tokens "
+            f"(rejets: liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote})"
+        )
+        send(
+            f"✅ dynamic={len(DYNAMIC_TOKENS)} "
+            f"(rejets liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote})"
+        )
     except Exception as e:
-        logger.error(f"refresh_dynamic_tokens error: {e}")
-        return
+        logger.warning(f"refresh_dynamic_tokens: {e}")
+        send(f"⚠️ dynamic=0 (erreur: {e})")
 
-    found = set()
-    rej_liq = rej_vol = rej_age = rej_quote = 0
 
-    pairs.sort(key=lambda p: pair_volume_h24_usd(p), reverse=True)
-    for p in pairs:
-        if len(found) >= DYNAMIC_MAX_TOKENS:
-            break
-        if (p.get("chainId") or "").lower() != "solana":
-            continue
-
-        base_mint = (p.get("baseToken") or {}).get("address")
-        if not base_mint:
-            continue
-
-        quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
-        if quote_sym not in ALLOWED_QUOTES:
-            rej_quote += 1
-            continue
-
-        liq_usd = pair_liquidity_usd(p)
-        vol_usd = pair_volume_h24_usd(p)
-        age = pair_age_sec(p)
-
-        if liq_usd < min_liq_usd:
-            rej_liq += 1
-            continue
-        if vol_usd < min_vol_usd:
-            rej_vol += 1
-            continue
-        if age < MIN_POOL_AGE_SEC:
-            rej_age += 1
-            continue
-
-        found.add(base_mint)
-
-    DYNAMIC_TOKENS = found
-    save_dynamic_tokens()
-    logger.info(
-        f"[dynamic] {len(DYNAMIC_TOKENS)} tokens "
-        f"(rejets: liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote})"
-    )
-    if not DYNAMIC_TOKENS:
-        send(f"⚠️ dynamic=0 (rejets: liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote})")
-    else:
-        send(f"✅ dynamic={len(DYNAMIC_TOKENS)} tokens actifs")
+def final_whitelist() -> Set[str]:
+    return set(FIXED_TOKENS) | set(DYNAMIC_TOKENS)
 
 # ============ Trading ============
+
 def enter_trade(pair: dict, sol_usd: float, score: str):
     if not can_open_more():
         return
@@ -667,6 +730,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     }
     save_positions()
 
+
 def close_position(mint: str, symbol: str, reason: str) -> bool:
     try:
         bal_amount = get_token_balance(mint)
@@ -680,6 +744,7 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         return True
     except Exception as e:
         send(f"❌ Vente {symbol} échouée: {e}"); return False
+
 
 def check_positions(sol_usd: float):
     to_close = []
@@ -711,6 +776,7 @@ def check_positions(sol_usd: float):
 # ====================
 # Scan de marché (loop)
 # ====================
+
 def scan_market():
     if HALT_TRADING: return
     try:
@@ -727,7 +793,8 @@ def scan_market():
             liq_usd = pair_liquidity_usd(p)
             vol_usd = pair_volume_h24_usd(p)
             age = pair_age_sec(p)
-            if liq_usd < min_liq_usd or vol_usd < min_vol_usd or age < MIN_POOL_AGE_SEC: continue
+            if not DYN_IGNORE_FILTERS:  # en mode diag on laisse passer
+                if liq_usd < min_liq_usd or vol_usd < min_vol_usd or age < MIN_POOL_AGE_SEC: continue
             chg = get_price_change_pct(p, PRICE_WINDOW)
             if math.isnan(chg): continue
             score = score_pair(chg, liq_usd, vol_usd, age, min_liq_usd, min_vol_usd)
@@ -743,8 +810,9 @@ def scan_market():
         send(f"⚠️ [scan error] {type(e).__name__}: {e}")
 
 # ==============================
-# Token discovery & diagnostics
+# Diagnostics & résumés
 # ==============================
+
 def health_check():
     results = {}
     try:
@@ -767,24 +835,28 @@ def health_check():
         results["jup_quote"] = False
     return results
 
+
 def send_boot_diagnostics():
     res = health_check()
     msg = (
-        "🩺 Self-check démarrage\n"
+        f"[{BOT_VERSION}] 🩺 Self-check démarrage\n"
         f"RPC: {ok(res.get('rpc', False))} | Solde: {res.get('balance')}\n"
         f"Jupiter Price: {ok(res.get('jup_price', False))} | SOL≈{res.get('sol_usd')}\n"
-        f"DexScreener /search: {ok(res.get('dex_search', False))} | pairs={res.get('pairs_count')}\n"
+        f"DexScreener: {ok(res.get('dex_search', False))} | pairs={res.get('pairs_count')}\n"
         f"Jupiter quote: {ok(res.get('jup_quote', False))}\n"
         f"Params ⇒ Seuil {int(ENTRY_THRESHOLD*100)}% | SL -{int(STOP_LOSS_PCT*100)}% | "
         f"Trailing +{int(TRAILING_TRIGGER_PCT*100)}% / -{int(TRAILING_THROWBACK_PCT*100)}% | "
-        f"Max {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: 15%{' (off)' if not ALLOW_A_TRADES else ''}\n"
+        f"Max {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: {A_SIZE_PCT_ENV or '15%'}{' (off)' if not ALLOW_A_TRADES else ''}\n"
         f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h | Fenêtre: {PRICE_WINDOW}\n"
-        f"Whitelist fixe: {len(FIXED_TOKENS)} | dyn: {len(DYNAMIC_TOKENS)} | tokenmap: {len(TOKEN_MAP)}"
+        f"Quotes dyn: {','.join(sorted(ALLOWED_QUOTES))} | Whitelist fixe: {len(FIXED_TOKENS)} | dyn: {len(DYNAMIC_TOKENS)} | tokenmap: {len(TOKEN_MAP)}\n"
+        f"Protocols: {','.join(sorted(ALLOWED_PROTOCOLS))}\n"
     )
     send(msg)
 
+
 def heartbeat():
     send(f"⏱️ Heartbeat {now_str()} | positions: {len(positions)} | blacklist: {len(BLACKLIST)} | dyn: {len(DYNAMIC_TOKENS)} | halt={HALT_TRADING}")
+
 
 def daily_summary():
     if positions:
@@ -801,16 +873,18 @@ def daily_summary():
 # ======================
 # Telegram commandes
 # ======================
-def handle_command(text: str):
+
+def handle_command(text: str, chat_id: str = None):
     global HALT_TRADING
-    t = text.strip().lower()
-    if t.startswith("/start"):
+    t = text.strip()
+    tl = t.lower()
+    if tl.startswith("/start"):
         HALT_TRADING = False; send("▶️ Trading activé.")
-    elif t.startswith("/stop"):
+    elif tl.startswith("/stop"):
         HALT_TRADING = True; send("⏸️ Trading en pause.")
-    elif t.startswith("/status"):
+    elif tl.startswith("/status"):
         send(f"ℹ️ Status {now_str()} | positions: {len(positions)} | blacklist: {len(BLACKLIST)} | dyn: {len(DYNAMIC_TOKENS)} | halt={HALT_TRADING}")
-    elif t.startswith("/testtrade"):
+    elif tl.startswith("/testtrade"):
         try:
             amt = max(0.002, PROBE_SOL); lamports = int(amt * 1_000_000_000)
             q = jup_quote(WSOL, USDC, lamports, min(SLIPPAGE_BPS, 50))
@@ -822,11 +896,55 @@ def handle_command(text: str):
             send(f"✅ TestTrade OK\nBuy Tx: {sig1}\nSell Tx: {sig2}")
         except Exception as e:
             send(f"❌ TestTrade error: {e}")
-    elif t.startswith("/refresh_tokens"):
-        refresh_token_map(); refresh_dynamic_tokens(); send("🔁 Tokens rafraîchis (map + dynamique).")
+    elif tl.startswith("/refresh_tokens"):
+        refresh_token_map(); refresh_dynamic_tokens();
+    elif tl.startswith("/dyninfo"):
+        try:
+            refresh_dynamic_tokens()
+        except Exception as e:
+            send(f"/dyninfo erreur: {e}")
+    elif tl.startswith("/forcebuy"):
+        try:
+            parts = t.split()
+            if len(parts) < 3:
+                send("Usage: /forcebuy <SYMBOL_ou_MINT> <montant_SOL>"); return
+            token = parts[1]
+            size_sol = float(parts[2])
+            mint, sym = resolve_symbol_or_mint(token)
+            if not mint:
+                send(f"Token introuvable: {token}"); return
+            if is_blacklisted(mint):
+                send(f"Token blacklist: {mint}"); return
+            if not PROBE_ENABLED or probe_trade(mint, str(kp.public_key)):
+                lamports = int(size_sol * 1_000_000_000)
+                q = jup_quote(WSOL, mint, lamports, SLIPPAGE_BPS)
+                if not q or not route_is_whitelisted(q):
+                    send("Route non whitelistée pour /forcebuy"); return
+                sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
+                send(f"🚨 FORCE BUY {sym} ({mint})\nMontant: {size_sol:.4f} SOL\nTx: {sig}")
+            else:
+                send("Sonde anti-honeypot KO — /forcebuy annulé.")
+        except Exception as e:
+            send(f"/forcebuy erreur: {e}")
+    elif tl.startswith("/reset_offset"):
+        try:
+            if os.path.exists(TG_OFFSET_PATH):
+                os.remove(TG_OFFSET_PATH)
+            send("♻️ Telegram offset reset. Réessayez vos commandes.")
+        except Exception as e:
+            send(f"reset_offset erreur: {e}")
+    elif tl.startswith("/whoami"):
+        if chat_id:
+            send_to(chat_id, f"Votre chat_id: {chat_id}")
+        else:
+            send("(whoami) chat_id indisponible")
+    elif tl.startswith("/version"):
+        send(f"{BOT_VERSION} | quotes={','.join(sorted(ALLOWED_QUOTES))} | protos={','.join(sorted(ALLOWED_PROTOCOLS))}")
+
 
 def poll_telegram():
-    if not TOKEN or not CHAT: return
+    if not TOKEN:
+        return
     try:
         offset = _load_tg_offset()
         r = http_get(
@@ -842,28 +960,40 @@ def poll_telegram():
             msg = u.get("message") or {}
             chat_id = str(((msg.get("chat") or {}).get("id")) or "")
             text = (msg.get("text") or "").strip()
-            if not text or chat_id != str(CHAT): continue
-            handle_command(text)
-        if last != offset: _save_tg_offset(last)
+            logger.info(f"[tg] recv chat_id={chat_id} text={text!r}")
+            # si CHAT est défini, on ne répond qu'à ce chat
+            if CHAT and chat_id != str(CHAT):
+                # mais on permet /whoami pour récupérer l'ID
+                if text.lower().startswith("/whoami"):
+                    send_to(chat_id, f"Votre chat_id: {chat_id}")
+                continue
+            if not text:
+                continue
+            handle_command(text, chat_id)
+        if last != offset:
+            _save_tg_offset(last)
     except Exception as e:
         logger.warning(f"poll_telegram: {e}")
 
 # ============ Boot message ============
+
 def boot_message():
     b = get_balance_sol()
     send(
-        "🚀 Bot prêt ✅ (Railway)\n"
+        f"[{BOT_VERSION}] 🚀 Bot prêt ✅\n"
         f"Seuil: {int(ENTRY_THRESHOLD*100)}% | SL: -{int(STOP_LOSS_PCT*100)}% | "
         f"Trailing: +{int(TRAILING_TRIGGER_PCT*100)}% / -{int(TRAILING_THROWBACK_PCT*100)}%\n"
-        f"Max trades: {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: 15%{' (off)' if not ALLOW_A_TRADES else ''}\n"
+        f"Max trades: {MAX_OPEN_TRADES} | Taille A+: {int(POSITION_SIZE_PCT*100)}% | A: {A_SIZE_PCT_ENV or '15%'}{' (off)' if not ALLOW_A_TRADES else ''}\n"
         f"Filtres: Liqu≥{MIN_LIQ_SOL} SOL, Vol≥{MIN_VOL_SOL} SOL, Âge≥{MIN_POOL_AGE_SEC//3600}h | Fenêtre: {PRICE_WINDOW}\n"
         f"DRY_RUN: {DRY_RUN} | PROBE: {PROBE_ENABLED} ({PROBE_SOL} SOL)\n"
-        f"Whitelist fixe: {len(FIXED_TOKENS)} | dynamique max: {DYNAMIC_MAX_TOKENS}"
+        f"Quotes dyn: {','.join(sorted(ALLOWED_QUOTES))} | Whitelist fixe: {len(FIXED_TOKENS)} | dynamique max: {DYNAMIC_MAX_TOKENS}\n"
+        f"Protocols: {','.join(sorted(ALLOWED_PROTOCOLS))}"
     )
 
 # =====================
 # Init & Scheduler
 # =====================
+
 def main():
     load_positions()
     load_blacklist()
@@ -871,7 +1001,7 @@ def main():
     load_token_map()
 
     boot_message()
-    refresh_token_map()          # important pour la résolution symboles->mint
+    refresh_token_map()
     refresh_dynamic_tokens()
     send_boot_diagnostics()
 
@@ -890,8 +1020,11 @@ def main():
         nonlocal running; running = False
     signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
 
-    while running: time.sleep(1)
-    scheduler.shutdown(); print("[exit] bye")
+    try:
+        while running:
+            time.sleep(1)
+    finally:
+        scheduler.shutdown(); print("[exit] bye")
 
 if __name__ == "__main__":
     main()
