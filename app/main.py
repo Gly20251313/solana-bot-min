@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Bot Solana — version 'full logs détaillés' + FINAL_WL_MODE
+Bot Solana — version 'full logs détaillés'
 - Journaux verbeux à chaque étape (fetch, ranking, dyn whitelist, scan, probe, buy/sell)
-- Whitelist de routes élargie + modes 'strict' / 'permissive' / 'off'
-- FINAL_WL_MODE: 'on'/'off' pour activer/désactiver la whitelist finale de mint
+- Whitelist de routes élargie + modes 'strict' / 'permissive'
 - Gestion des erreurs Jupiter (slippage/exactOut) avec retry et dynamic slippage
 - Seuils en USD (MIN_LIQ_USD) + fallback en SOL
-- Télégram + heartbeat + récap quotidien
+- Télégram + battement + récap quotidien
 """
-import os, time, json, base64, math, uuid, re, logging
+import os, sys, time, json, base64, math, uuid, re, logging
 from typing import Dict, Any, Set, Tuple, List
 from datetime import datetime
 
@@ -25,7 +24,7 @@ from solana.rpc.types import TxOpts
 # ======================
 # Version & ENV
 # ======================
-BOT_VERSION = os.getenv("BOT_VERSION", "v2.4-final-wl-toggle-2025-08-17")
+BOT_VERSION = os.getenv("BOT_VERSION", "v2.3-full-logs-2025-08-17")
 
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -48,6 +47,9 @@ MIN_TRADE_SOL            = float(os.getenv("MIN_TRADE_SOL", "0.03"))
 DRY_RUN                  = os.getenv("DRY_RUN", "0") == "1"
 
 PROBE_ENABLED            = os.getenv("PROBE_ENABLED", "1") == "1"
+
+FINAL_WL_MODE = os.getenv("FINAL_WL_MODE", "on").lower() in ("on", "true", "1")
+DEBUG_PROBE   = os.getenv("DEBUG_PROBE", "0") == "1"
 PROBE_SOL                = float(os.getenv("PROBE_SOL", "0.005"))
 PROBE_SLIPPAGE_BPS       = int(os.getenv("PROBE_SLIPPAGE_BPS", "120"))
 PROBE_SELL_FACTOR        = float(os.getenv("PROBE_SELL_FACTOR", "0.95"))
@@ -70,12 +72,10 @@ DYN_CACHE_PATH           = os.getenv("DYN_CACHE_PATH", "./dynamic_tokens.json")
 TOKENMAP_CACHE_PATH      = os.getenv("TOKENMAP_CACHE_PATH", "./token_map.json")
 TG_OFFSET_PATH           = os.getenv("TELEGRAM_OFFSET_PATH", "./tg_offset.json")
 
-# Whitelists
-WHITELIST_MODE           = os.getenv("WHITELIST_MODE", "permissive").strip().lower()  # "strict"|"permissive"|"off"
-FINAL_WL_MODE            = os.getenv("FINAL_WL_MODE", "on").strip().lower()          # "on" | "off"
-DATA_SOURCE              = os.getenv("DATA_SOURCE", "").upper()                      # "", "GECKO"
+WHITELIST_MODE           = os.getenv("WHITELIST_MODE", "permissive").strip().lower()  # "strict"|"permissive"
+DATA_SOURCE              = os.getenv("DATA_SOURCE", "").upper()  # "", "GECKO"
 
-# Logs
+# Logs détaillés
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_SAMPLE_LIMIT = int(os.getenv("LOG_SAMPLE_LIMIT", "5"))
 DEBUG_REJECTIONS = os.getenv("DEBUG_REJECTIONS", "1") == "1"
@@ -404,6 +404,7 @@ def _candidate_score(p: dict, sol_usd: float) -> float:
 
 def rank_candidates(pairs: list, sol_usd: float) -> list:
     ranked = sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
+    # Log top sample
     for i, p in enumerate(ranked[:LOG_SAMPLE_LIMIT]):
         b = (p.get("baseToken") or {}).get("symbol") or "?"
         q = (p.get("quoteToken") or {}).get("symbol") or "?"
@@ -411,7 +412,7 @@ def rank_candidates(pairs: list, sol_usd: float) -> list:
     return ranked
 
 # ======================
-# Whitelist patterns (routes)
+# Whitelist patterns
 # ======================
 def _build_allowed_patterns():
     pats = set()
@@ -442,11 +443,10 @@ def route_is_whitelisted(quote: dict, return_labels: bool=False):
         lbl = label.lower()
         if not any(pat in lbl for pat in _ALLOWED_PATTERNS):
             unknowns.append(label)
-    if WHITELIST_MODE == "strict" and unknowns:
+    if unknowns and WHITELIST_MODE == "strict":
         return (False, labels) if return_labels else False
-    # permissive/off: on laisse passer, on log juste
-    if unknowns and WHITELIST_MODE in ("permissive", "off"):
-        logger.info("route tolerated ("+WHITELIST_MODE+"): "+", ".join([u for u in unknowns if u]))
+    if unknowns and WHITELIST_MODE == "permissive":
+        logger.info("route tolerated (permissive): "+", ".join([u for u in unknowns if u]))
     return (True, labels) if return_labels else True
 
 # ======================
@@ -533,13 +533,10 @@ def ok(b: bool) -> str: return "✅" if b else "❌"
 def short_mint(m: str) -> str:
     return (m[:4]+"…"+m[-4:]) if (m and len(m) > 10) else (m or "?")
 
-def final_wl_enabled() -> bool:
-    return FINAL_WL_MODE != "off"
-
 def log_env_config():
     send(
         f"[{BOT_VERSION}] ⚙️ ENV\n"
-        f"WL-route={WHITELIST_MODE} | FINAL_WL={FINAL_WL_MODE} | DATA_SOURCE={DATA_SOURCE}\n"
+        f"WL-mode={WHITELIST_MODE} | DATA_SOURCE={DATA_SOURCE}\n"
         f"MIN_LIQ_USD={MIN_LIQ_USD} | MIN_LIQ_SOL={MIN_LIQ_SOL} | MIN_VOL_SOL={MIN_VOL_SOL} | AGE≥{MIN_POOL_AGE_SEC}s\n"
         f"Quotes dyn={','.join(sorted(ALLOWED_QUOTES))}\n"
         f"Protos={','.join(sorted(ALLOWED_PROTOCOLS))}\n"
@@ -663,7 +660,7 @@ def size_for_score(balance_sol: float, score: str) -> float:
     return min(size_sol, balance_sol * 0.99)
 
 # ==========================
-# Dynamic whitelist (mints)
+# Dynamic whitelist
 # ==========================
 def refresh_dynamic_tokens():
     global DYNAMIC_TOKENS
@@ -688,6 +685,7 @@ def refresh_dynamic_tokens():
             if (p.get("chainId") or "").lower() != "solana": continue
 
             base_mint = (p.get("baseToken") or {}).get("address")
+            base_sym  = (p.get("baseToken") or {}).get("symbol")
             quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
             if not base_mint: continue
             if base_mint in found: rej_dupe += 1; continue
@@ -733,15 +731,8 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     base_mint = (pair.get("baseToken") or {}).get("address")
     base_sym  = (pair.get("baseToken") or {}).get("symbol") or "TOKEN"
     pair_url  = pair.get("url") or "https://dexscreener.com/solana"
-    if not base_mint: return
-    if base_mint in positions: return
-    if is_blacklisted(base_mint): return
-
-    # respect whitelist finale uniquement si activée
-    if final_wl_enabled():
-        wl = final_whitelist()
-        if base_mint not in wl: return
-
+    wl = final_whitelist()
+    if not base_mint or base_mint in positions or base_mint not in wl or is_blacklisted(base_mint): return
     balance = get_balance_sol()
     size_sol = size_for_score(balance, score)
     if size_sol <= 0: return
@@ -827,8 +818,7 @@ def scan_market():
         pairs = fetch_pairs()
         if not pairs: return
         pairs = rank_candidates(pairs, sol_usd)
-
-        wl = final_whitelist() if final_wl_enabled() else set()
+        wl = final_whitelist()
         candidates = []
         debug_sent = 0
 
@@ -836,11 +826,9 @@ def scan_market():
             base_mint = (p.get("baseToken") or {}).get("address")
             base_sym  = (p.get("baseToken") or {}).get("symbol") or "?"
             if not base_mint: continue
-
-            if final_wl_enabled() and base_mint not in wl:
+            if base_mint not in wl:
                 if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
-                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale"
-                    logger.info(msg); send(msg); debug_sent += 1
+                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale"; logger.info(msg); send(msg); debug_sent += 1
                 continue
 
             liq_usd = pair_liquidity_usd(p)
@@ -854,8 +842,7 @@ def scan_market():
                 if age < MIN_POOL_AGE_SEC: reasons.append(f"age {int(age)}<{MIN_POOL_AGE_SEC}s")
                 if reasons:
                     if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
-                        msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: "+", ".join(reasons)
-                        logger.info(msg); send(msg); debug_sent += 1
+                        msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: "+", ".join(reasons); logger.info(msg); send(msg); debug_sent += 1
                     continue
 
             chg = get_price_change_pct(p, PRICE_WINDOW)
@@ -875,7 +862,7 @@ def scan_market():
         check_positions(sol_usd)
 
         if DEBUG_REJECTIONS and opened == 0:
-            logger.info(f"[scan] aucun trade ouvert — candidats={len(candidates)} dyn={len(DYNAMIC_TOKENS)} FINAL_WL={FINAL_WL_MODE}")
+            logger.info(f"[scan] aucun trade ouvert — candidats={len(candidates)} dyn={len(DYNAMIC_TOKENS)}")
 
     except Exception as e:
         send("⚠️ [scan error] "+type(e).__name__+": "+str(e))
@@ -918,8 +905,7 @@ def send_boot_diagnostics():
         + "Max "+str(MAX_OPEN_TRADES)+" | Taille A+: "+str(int(POSITION_SIZE_PCT*100))+"% | A: "+str(int(float(A_SIZE_PCT_ENV)*100))+"%\n"
         + "Filtres: Liqu≥"+(str(MIN_LIQ_USD)+" USD" if MIN_LIQ_USD>0 else (str(MIN_LIQ_SOL)+" SOL"))
         + ", Vol≥"+str(MIN_VOL_SOL)+" SOL, Âge≥"+str(MIN_POOL_AGE_SEC//60)+"min | Fenêtre: "+PRICE_WINDOW+"\n"
-        + "Quotes dyn: "+",".join(sorted(ALLOWED_QUOTES))+" | Prot: "+",".join(sorted(ALLOWED_PROTOCOLS))+"\n"
-        + "WL-route: "+WHITELIST_MODE+" | FINAL_WL: "+FINAL_WL_MODE
+        + "Quotes dyn: "+",".join(sorted(ALLOWED_QUOTES))+" | Prot: "+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-mode: "+WHITELIST_MODE
     )
     send(msg)
 
@@ -999,7 +985,7 @@ def handle_command(text: str, chat_id: str = None):
         if chat_id: send_to(chat_id, "Votre chat_id: "+chat_id)
         else: send("(whoami) chat_id indisponible")
     elif tl.startswith("/version"):
-        send(BOT_VERSION+" | quotes="+",".join(sorted(ALLOWED_QUOTES))+" | protos="+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-route="+WHITELIST_MODE+" | FINAL_WL="+FINAL_WL_MODE)
+        send(BOT_VERSION+" | quotes="+",".join(sorted(ALLOWED_QUOTES))+" | protos="+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-mode="+WHITELIST_MODE)
 
 def poll_telegram():
     if not TOKEN: return
@@ -1036,8 +1022,7 @@ def boot_message():
          + ", Vol≥"+str(MIN_VOL_SOL)+" SOL, Âge≥"+str(MIN_POOL_AGE_SEC//60)+"min | Fenêtre: "+PRICE_WINDOW+"\n"
          + "DRY_RUN: "+str(DRY_RUN)+" | PROBE: "+str(PROBE_ENABLED)+" ("+str(PROBE_SOL)+" SOL; "+str(PROBE_SLIPPAGE_BPS)+"bps)\n"
          + "Quotes dyn: "+",".join(sorted(ALLOWED_QUOTES))+" | dynamique max: "+str(DYNAMIC_MAX_TOKENS)+"\n"
-         + "Protocols: "+",".join(sorted(ALLOWED_PROTOCOLS))+"\n"
-         + "WL-route: "+WHITELIST_MODE+" | FINAL_WL: "+FINAL_WL_MODE
+         + "Protocols: "+",".join(sorted(ALLOWED_PROTOCOLS))+" | WL-mode: "+WHITELIST_MODE
     )
 
 def main():
@@ -1065,3 +1050,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def wl_final_allows(mint: str) -> bool:
+    # si FINAL_WL_MODE=off → on n’exige pas la présence dans la whitelist finale
+    if not FINAL_WL_MODE:
+        return True
+    return mint in final_whitelist()
