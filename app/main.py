@@ -572,42 +572,60 @@ def size_for_score(balance_sol: float, score: str) -> float:
 # Whitelist dynamique (DexS)
 # ==========================
 def refresh_dynamic_tokens():
-    """Construit une liste dynamique (jusqu’à DYNAMIC_MAX_TOKENS) selon volume/liquidité/âge côté SOL/USDC."""
+   def refresh_dynamic_tokens():
+    """Met à jour la whitelist dynamique à partir de DexScreener"""
     global DYNAMIC_TOKENS
     try:
-        sol_usd = get_sol_usd()
-        min_liq_usd = MIN_LIQ_SOL * sol_usd
-        min_vol_usd = MIN_VOL_SOL * sol_usd
         pairs = fetch_pairs()
-        if not pairs:
-            return
-        found: Set[str] = set()
-        pairs.sort(key=lambda p: pair_volume_h24_usd(p), reverse=True)
-        for p in pairs:
-            if len(found) >= DYNAMIC_MAX_TOKENS:
-                break
-            if (p.get("chainId") or "").lower() != "solana":
-                continue
-            liq_usd = pair_liquidity_usd(p)
-            vol_usd = pair_volume_h24_usd(p)
-            age = pair_age_sec(p)
-            if liq_usd < min_liq_usd or vol_usd < min_vol_usd or age < MIN_POOL_AGE_SEC:
-                continue
-            base_mint = (p.get("baseToken") or {}).get("address")
-            quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
-            if not base_mint:
-                continue
-            if quote_sym not in ALLOWED_QUOTES:
-                continue
-            found.add(base_mint)
-        DYNAMIC_TOKENS = found
-        save_dynamic_tokens()
-        logger.info(f"[dynamic] rafraîchi: {len(DYNAMIC_TOKENS)} tokens")
     except Exception as e:
-        logger.warning(f"refresh_dynamic_tokens: {e}")
+        logger.error(f"refresh_dynamic_tokens error: {e}")
+        return
 
-def final_whitelist() -> Set[str]:
-    return set(FIXED_TOKENS) | set(DYNAMIC_TOKENS)
+    found = set()
+    rej_liq = rej_vol = rej_age = rej_quote = 0
+
+    pairs.sort(key=lambda p: pair_volume_h24_usd(p), reverse=True)
+    for p in pairs:
+        if len(found) >= DYNAMIC_MAX_TOKENS:
+            break
+        if (p.get("chainId") or "").lower() != "solana":
+            continue
+
+        base_mint = (p.get("baseToken") or {}).get("address")
+        if not base_mint:
+            continue
+
+        quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
+        if quote_sym not in ALLOWED_QUOTES:
+            rej_quote += 1
+            continue
+
+        liq_usd = pair_liquidity_usd(p)
+        vol_usd = pair_volume_h24_usd(p)
+        age = pair_age_sec(p)
+
+        if liq_usd < min_liq_usd:
+            rej_liq += 1
+            continue
+        if vol_usd < min_vol_usd:
+            rej_vol += 1
+            continue
+        if age < MIN_POOL_AGE_SEC:
+            rej_age += 1
+            continue
+
+        found.add(base_mint)
+
+    DYNAMIC_TOKENS = found
+    save_dynamic_tokens()
+    logger.info(
+        f"[dynamic] {len(DYNAMIC_TOKENS)} tokens "
+        f"(rejets: liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote})"
+    )
+    if not DYNAMIC_TOKENS:
+        send(f"⚠️ dynamic=0 (rejets: liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote})")
+    else:
+        send(f"✅ dynamic={len(DYNAMIC_TOKENS)} tokens actifs")
 
 # ============ Trading ============
 def enter_trade(pair: dict, sol_usd: float, score: str):
