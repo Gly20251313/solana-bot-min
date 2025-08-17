@@ -342,18 +342,6 @@ def _candidate_score(p: dict, sol_usd: float) -> float:
 def rank_candidates(pairs: list, sol_usd: float) -> list:
     return sorted(pairs, key=lambda p: _candidate_score(p, sol_usd), reverse=True)
 
-    pats = set()
-    for p in ALLOWED_PROTOCOLS:
-        s = p.lower().strip()
-        if not s: continue
-        pats.add(s)
-        if s == "orca": pats.update(["whirlpool"])
-        if s == "raydium": pats.update(["raydium clmm", "raydium cpmm"])
-        if s in ("openbook","serum"): pats.update(["openbook","serum"])
-        if s == "meteora": pats.update(["meteora","dlmm"])
-    return pats
-
-
 
 def _build_allowed_patterns():
     pats = set()
@@ -376,34 +364,7 @@ def _build_allowed_patterns():
 
 
 _ALLOWED_PATTERNS = _build_allowed_patterns()
-_ALLOWED_PATTERNS = _build_allowed_patterns()
 def route_is_whitelisted(quote: dict, return_labels: bool = False):
-    rp = quote.get("routePlan") or quote.get("marketInfos") or []
-    labels = []
-    if not isinstance(rp, list):
-        return (False, labels) if return_labels else False
-    for step in rp:
-        info = step.get("swapInfo") or step
-        label = (info.get("label") or info.get("protocol") or "").strip()
-        labels.append(label)
-        lbl = label.lower()
-        # tolérance: "contains" sur les libellés connus
-        if not any(pat in lbl for pat in _ALLOWED_PATTERNS):
-            return (False, labels) if return_labels else False
-    return (True, labels) if return_labels else True
-
-    rp = quote.get("routePlan") or quote.get("marketInfos") or []
-    labels = []
-    if not isinstance(rp, list):
-        return (False, labels) if return_labels else False
-    for step in rp:
-        info = step.get("swapInfo") or step
-        label = (info.get("label") or info.get("protocol") or "").strip()
-        labels.append(label)
-        lbl = label.lower()
-        if not any(p in lbl for p in _ALLOWED_PATTERNS):
-            return (False, labels) if return_labels else False
-    return (True, labels) if return_labels else True
 
 def jup_quote(input_mint: str, output_mint: str, in_amount_lamports: int, slippage_bps: int):
     params = {
@@ -558,58 +519,6 @@ def probe_trade(mint: str, user_pubkey: str):
         logger.warning("probe_trade: " + str(e))
         return False
 
-    global DYNAMIC_TOKENS
-    try:
-        sol_usd = get_sol_usd()
-        min_liq_usd = MIN_LIQ_SOL * sol_usd
-        min_vol_usd = MIN_VOL_SOL * sol_usd
-
-        pairs = fetch_pairs()
-        if not pairs:
-            DYNAMIC_TOKENS = set(); save_dynamic_tokens()
-            send("⚠️ dynamic=0 (source vide)"); return
-
-        pairs = rank_candidates(pairs, sol_usd)
-
-        found = set()
-        per_quote: Dict[str, int] = {}
-        rej_liq = rej_vol = rej_age = rej_quote = 0
-
-        for p in pairs:
-            if len(found) >= DYNAMIC_MAX_TOKENS: break
-            if (p.get("chainId") or "").lower() != "solana": continue
-
-            base_mint = (p.get("baseToken") or {}).get("address")
-            if not base_mint: continue
-
-            quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
-            if quote_sym not in ALLOWED_QUOTES:
-                rej_quote += 1; continue
-
-            if per_quote.get(quote_sym, 0) >= MAX_PER_QUOTE:
-                continue
-
-            if DYN_IGNORE_FILTERS:
-                found.add(base_mint)
-                per_quote[quote_sym] = per_quote.get(quote_sym, 0) + 1
-                continue
-
-            liq_usd = pair_liquidity_usd(p)
-            vol_usd = pair_volume_h24_usd(p)
-            age = pair_age_sec(p)
-
-            if liq_usd < min_liq_usd: rej_liq += 1; continue
-            if vol_usd < min_vol_usd: rej_vol += 1; continue
-            if age < MIN_POOL_AGE_SEC: rej_age += 1; continue
-
-            found.add(base_mint)
-            per_quote[quote_sym] = per_quote.get(quote_sym, 0) + 1
-
-        DYNAMIC_TOKENS = found
-        save_dynamic_tokens()
-        send("✅ dynamic=" + str(len(DYNAMIC_TOKENS)) + " (rejets liq=" + str(rej_liq) + ", vol=" + str(rej_vol) + ", age=" + str(rej_age) + ", quote=" + str(rej_quote) + ")")
-    except Exception as e:
-        send("⚠️ dynamic=0 (erreur: " + str(e) + ")")
 
 def final_whitelist() -> Set[str]:
     fixed = {WSOL, USDC,
@@ -649,7 +558,94 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         if pi is not None:
             send("⛔ Price impact " + f"{pi:.2f}" + "% > cap " + str(MAX_PRICE_IMPACT_PCT) + "% → skip"); return
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key)))
-        send("📈 Achat " + base_sym + " [" + score + "]\nMontant: " + f"{size_sol:.4f}" + " SOL\nPair: " + pair_url + "\nID: " + trade_id + "\nTx: " + str(sig))
+        send(
+
+
+
+def size_for_score(balance_sol: float, score: str) -> float:
+    if score == "A+":
+        pct = POSITION_SIZE_PCT
+    elif score == "A" and ALLOW_A_TRADES:
+        pct = float(A_SIZE_PCT_ENV)
+    else:
+        return 0.0
+    size_sol = max(balance_sol * pct, MIN_TRADE_SOL)
+    return min(size_sol, balance_sol * 0.99)
+def score_pair(chg_pct: float, liq_usd: float, vol_usd: float, age_sec: float, min_liq_usd: float, min_vol_usd: float) -> str:
+    if chg_pct < ENTRY_THRESHOLD * 100:
+        return "B"
+    hard = (liq_usd >= min_liq_usd) and (vol_usd >= min_vol_usd) and (age_sec >= MIN_POOL_AGE_SEC)
+    if hard:
+        return "A+"
+    soft = (liq_usd >= 0.9*min_liq_usd) and (vol_usd >= min_vol_usd) and (age_sec >= 0.5*MIN_POOL_AGE_SEC)
+    return "A" if soft else "B"
+
+
+def refresh_dynamic_tokens():
+    global DYNAMIC_TOKENS
+    try:
+        sol_usd = get_sol_usd()
+        min_liq_usd = MIN_LIQ_SOL * sol_usd
+        min_vol_usd = MIN_VOL_SOL * sol_usd
+
+        pairs = fetch_pairs()
+        if not pairs:
+            DYNAMIC_TOKENS = set()
+            save_dynamic_tokens()
+            send("⚠️ dynamic=0 (source vide)")
+            return DYNAMIC_TOKENS
+
+        pairs = rank_candidates(pairs, sol_usd)
+
+        found = set()
+        per_quote: Dict[str, int] = {}
+        rej_liq = rej_vol = rej_age = rej_quote = 0
+
+        for p in pairs:
+            if len(found) >= DYNAMIC_MAX_TOKENS:
+                break
+            if (p.get("chainId") or "").lower() != "solana":
+                continue
+
+            base_mint = (p.get("baseToken") or {}).get("address")
+            if not base_mint:
+                continue
+
+            quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
+            if quote_sym not in ALLOWED_QUOTES:
+                rej_quote += 1
+                continue
+
+            if per_quote.get(quote_sym, 0) >= MAX_PER_QUOTE:
+                continue
+
+            if DYN_IGNORE_FILTERS:
+                found.add(base_mint)
+                per_quote[quote_sym] = per_quote.get(quote_sym, 0) + 1
+                continue
+
+            liq_usd = pair_liquidity_usd(p)
+            vol_usd = pair_volume_h24_usd(p)
+            age = pair_age_sec(p)
+
+            if liq_usd < min_liq_usd:
+                rej_liq += 1; continue
+            if vol_usd < min_vol_usd:
+                rej_vol += 1; continue
+            if age < MIN_POOL_AGE_SEC:
+                rej_age += 1; continue
+
+            found.add(base_mint)
+            per_quote[quote_sym] = per_quote.get(quote_sym, 0) + 1
+
+        DYNAMIC_TOKENS = found
+        save_dynamic_tokens()
+        send("✅ dynamic=" + str(len(DYNAMIC_TOKENS)) + " (rejets liq=" + str(rej_liq) + ", vol=" + str(rej_vol) + ", age=" + str(rej_age) + ", quote=" + str(rej_quote) + ")")
+        return DYNAMIC_TOKENS
+    except Exception as e:
+        send("⚠️ dynamic=0 (erreur: " + str(e) + ")")
+        return set()
+"📈 Achat " + base_sym + " [" + score + "]\nMontant: " + f"{size_sol:.4f}" + " SOL\nPair: " + pair_url + "\nID: " + trade_id + "\nTx: " + str(sig))
     except Exception as e:
         send("❌ Achat " + base_sym + " échoué: " + str(e)); return
     price_sol = pair_price_in_sol(pair, sol_usd)
