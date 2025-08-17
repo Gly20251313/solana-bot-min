@@ -74,11 +74,6 @@ DATA_SOURCE              = os.getenv("DATA_SOURCE", "").upper()  # "", "GECKO"
 
 # Logs détaillés
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-# --- WL / Debug flags (added) ---
-FINAL_WL_MODE = os.getenv("FINAL_WL_MODE", "on").lower() in ("on","true","1")
-WHITELIST_MODE = os.getenv("WHITELIST_MODE", os.getenv("WL_MODE","strict")).lower()
-DEBUG_PROBE = os.getenv("DEBUG_PROBE","0") == "1"
 LOG_SAMPLE_LIMIT = int(os.getenv("LOG_SAMPLE_LIMIT", "5"))
 DEBUG_REJECTIONS = os.getenv("DEBUG_REJECTIONS", "1") == "1"
 ROUTE_LOG_LIMIT  = int(os.getenv("ROUTE_LOG_LIMIT", "4"))
@@ -432,7 +427,7 @@ def _build_allowed_patterns():
     return pats
 _ALLOWED_PATTERNS = _build_allowed_patterns()
 
-def route_is_whitelisted_relaxed(quote: dict, return_labels: bool=False):
+def route_is_whitelisted(quote: dict, return_labels: bool=False):
     rp = quote.get("routePlan") or quote.get("marketInfos") or []
     labels = []
     if not isinstance(rp, list):
@@ -452,12 +447,12 @@ def route_is_whitelisted_relaxed(quote: dict, return_labels: bool=False):
     return (True, labels) if return_labels else True
 
 def route_is_whitelisted_relaxed(quote: dict, return_labels: bool=False):
-    """Wrapper respecting WHITELIST_MODE.
-    - If WHITELIST_MODE in {'off','permissive'}: allow all routes (keep probe protection).
-    - Else: fallback to original route_is_whitelisted.
-    """
-    if 'WHITELIST_MODE' in globals() and WHITELIST_MODE in {'off','permissive'}:
-        return (True, ['*']) if return_labels else True
+    """If WHITELIST_MODE in {'off','permissive'}: allow everything (probe still protects)."""
+    try:
+        if 'WHITELIST_MODE' in globals() and WHITELIST_MODE in {'off','permissive'}:
+            return (True, ['*']) if return_labels else True
+    except Exception:
+        pass
     return route_is_whitelisted_relaxed(quote, return_labels=return_labels)
 
 
@@ -736,17 +731,14 @@ def final_whitelist() -> Set[str]:
     return set(fixed) | set(DYNAMIC_TOKENS)
 
 def is_in_final_whitelist(mint: str) -> bool:
-    """Wrapper that respects FINAL_WL_MODE.
-    - If FINAL_WL_MODE is off: always True (we rely on filters + probe)
-    - Else: require membership in final_whitelist().
-    """
+    """Respect FINAL_WL_MODE if present. If off -> always True."""
     try:
-        if not FINAL_WL_MODE:
+        if 'FINAL_WL_MODE' in globals() and not FINAL_WL_MODE:
             return True
         wl = final_whitelist()
         return mint in wl
     except Exception:
-        return (not FINAL_WL_MODE)
+        return ('FINAL_WL_MODE' in globals() and not FINAL_WL_MODE)
 
 
 # ======================
@@ -852,9 +844,9 @@ def scan_market():
             base_mint = (p.get("baseToken") or {}).get("address")
             base_sym  = (p.get("baseToken") or {}).get("symbol") or "?"
             if not base_mint: continue
-            if not is_in_final_whitelist(base_mint):
+            if base_mint not in wl:
                 if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
-                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale (FINAL_WL_MODE=on)"; logger.info(msg); send(msg); debug_sent += 1
+                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors whitelist finale"; logger.info(msg); send(msg); debug_sent += 1
                 continue
 
             liq_usd = pair_liquidity_usd(p)
@@ -1076,3 +1068,132 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _pair_name(p: dict) -> str:
+    try:
+        bs = (p.get("baseToken") or {}).get("symbol") or "TOKEN"
+        qs = (p.get("quoteToken") or {}).get("symbol") or ""
+        return f"{bs}/{qs}" if qs else bs
+    except Exception:
+        return "PAIR"
+
+def _reject_log(p: dict, reason: str, detail: str = ""):
+    if not ('DEBUG_REJECT' in globals() and DEBUG_REJECT):
+        return
+    try:
+        nm = _pair_name(p)
+        url = p.get("url") or ""
+        if detail:
+            logger.info(f"[reject][{reason}] {nm} {detail} {url}")
+        else:
+            logger.info(f"[reject][{reason}] {nm} {url}")
+    except Exception as e:
+        logger.debug("reject_log err: " + str(e))
+
+
+# ====================
+# Patched scan_market with explicit reject reasons
+# ====================
+def scan_market():
+    if 'HALT_TRADING' in globals() and HALT_TRADING:
+        return
+    try:
+        sol_usd = get_sol_usd()
+        min_liq_usd = MIN_LIQ_SOL * sol_usd
+        min_vol_usd = MIN_VOL_SOL * sol_usd
+
+        pairs = fetch_pairs()
+        if not pairs:
+            logger.info("[scan] no pairs fetched")
+            return
+
+        pairs = rank_candidates(pairs, sol_usd)
+
+        candidates = []
+        seen_mints = set()
+
+        for p in pairs:
+            try:
+                if (p.get("chainId") or "").lower() != "solana":
+                    _reject_log(p, "chain", "not solana")
+                    continue
+
+                base_mint = (p.get("baseToken") or {}).get("address")
+                quote_sym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
+
+                if not base_mint:
+                    _reject_log(p, "mint", "missing base mint")
+                    continue
+
+                if base_mint in seen_mints:
+                    _reject_log(p, "dupe", "same base mint seen in this batch")
+                    continue
+
+                if not is_in_final_whitelist(base_mint):
+                    _reject_log(p, "final_wl", "not in final whitelist")
+                    continue
+
+                if 'ALLOWED_QUOTES' in globals() and ALLOWED_QUOTES:
+                    if quote_sym and (quote_sym not in ALLOWED_QUOTES):
+                        _reject_log(p, "quote", f"{quote_sym} not allowed")
+                        continue
+
+                liq_usd = pair_liquidity_usd(p)
+                if liq_usd < min_liq_usd:
+                    _reject_log(p, "liq", f"${liq_usd:,.0f} < ${min_liq_usd:,.0f}")
+                    continue
+
+                vol_usd = pair_volume_h24_usd(p)
+                if vol_usd < min_vol_usd:
+                    _reject_log(p, "vol", f"${vol_usd:,.0f} < ${min_vol_usd:,.0f}")
+                    continue
+
+                age = pair_age_sec(p)
+                if age < MIN_POOL_AGE_SEC:
+                    _reject_log(p, "age", f"{int(age)}s < {int(MIN_POOL_AGE_SEC)}s")
+                    continue
+
+                chg = get_price_change_pct(p, PRICE_WINDOW)
+                if chg != chg:  # NaN
+                    _reject_log(p, "price_change", "NaN")
+                    continue
+
+                score = score_pair(chg, liq_usd, vol_usd, age, min_liq_usd, min_vol_usd)
+                if score not in ("A+","A") or (score == "A" and not ALLOW_A_TRADES):
+                    _reject_log(p, "score", f"{score} filtered")
+                    continue
+
+                candidates.append((chg, score, p))
+                seen_mints.add(base_mint)
+
+            except Exception as e:
+                logger.debug("[scan][pair] error: " + str(e))
+                continue
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        if not candidates:
+            logger.info("[scan] aucun trade ouvert — candidats=0 dyn=" + str(len(DYNAMIC_TOKENS)))
+        else:
+            logger.info("[scan] candidats=" + str(len(candidates)) + " dyn=" + str(len(DYNAMIC_TOKENS)))
+
+        for chg, score, p in candidates:
+            try:
+                if not can_open_more():
+                    break
+                base_mint = (p.get("baseToken") or {}).get("address")
+                if not base_mint or base_mint in positions:
+                    _reject_log(p, "pos", "already in positions or missing mint")
+                    continue
+                enter_trade(p, sol_usd, score)
+            except Exception as e:
+                logger.debug("[scan][enter] " + str(e))
+
+        check_positions(sol_usd)
+
+    except Exception as e:
+        try:
+            send("⚠️ [scan error] " + type(e).__name__ + ": " + str(e))
+        except Exception:
+            logger.warning("[scan error] " + type(e).__name__ + ": " + str(e))
