@@ -353,7 +353,6 @@ def rank_candidates(pairs: list, sol_usd: float) -> list:
         if s == "meteora": pats.update(["meteora","dlmm"])
     return pats
 
-_ALLOWED_PATTERNS = _build_allowed_patterns()
 
 
 def _build_allowed_patterns():
@@ -375,8 +374,9 @@ def _build_allowed_patterns():
             pats.update(["pump.fun", "amm"])
     return pats
 
-_ALLOWED_PATTERNS = _build_allowed_patterns()
 
+_ALLOWED_PATTERNS = _build_allowed_patterns()
+_ALLOWED_PATTERNS = _build_allowed_patterns()
 def route_is_whitelisted(quote: dict, return_labels: bool = False):
     rp = quote.get("routePlan") or quote.get("marketInfos") or []
     labels = []
