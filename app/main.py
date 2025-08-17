@@ -1197,3 +1197,19 @@ def scan_market():
             send("⚠️ [scan error] " + type(e).__name__ + ": " + str(e))
         except Exception:
             logger.warning("[scan error] " + type(e).__name__ + ": " + str(e))
+
+
+# --- Post-define fixer (in case final_whitelist was defined after our first wrapper) ---
+try:
+    if '_original_final_whitelist' not in globals() and 'final_whitelist' in globals():
+        _original_final_whitelist = final_whitelist
+        class _AllowAllSet(set):
+            def __contains__(self, item):
+                return True
+        def final_whitelist():
+            wl = set(_original_final_whitelist())
+            if WHITELIST_MODE in ("off", "permissive"):
+                return _AllowAllSet(wl)
+            return wl
+except Exception:
+    pass
