@@ -728,6 +728,7 @@ def final_() -> set:
 def is_in_final_(mint: str) -> bool:
     # Toujours vrai : tout token est autorisé
     return True
+True
 
 (mint: str) -> bool:
     # Toujours vrai : tout token est autorisé
