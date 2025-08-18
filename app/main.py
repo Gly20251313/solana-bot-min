@@ -721,16 +721,15 @@ def refresh_dynamic_tokens():
     except Exception as e:
         send("⚠️ dynamic=0 (erreur: "+str(e)+")"); return set()
 
-def final_() -> Set[str]:
-    fixed = {WSOL, USDC,
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-        "JUP4Fb2w9Q3ZHzGVzF4Xz9c2yRt7ppJQkG5CS84VmQp",   # JUP
-        "DezXAZ8z7PnrnRJjz3wXBoTvuQYFxRpwk4cEb9CZxbnS",  # BONK
-        "4k3Dyjzvzp8eK7CkHxYfzznHVfhnF1Vd1z1dcz7URb1t",  # RAY
-    }
-    return set(fixed) | set(DYNAMIC_TOKENS)
+def final_() -> set:
+    # Whitelist finale désactivée : on ne filtre plus rien
+    return set(DYNAMIC_TOKENS)
 
 def is_in_final_(mint: str) -> bool:
+    # Toujours vrai : tout token est autorisé
+    return True
+
+(mint: str) -> bool:
     """Respect FINAL_WL_MODE if present. If off -> always True."""
     try:
         if 'FINAL_WL_MODE' in globals() and not FINAL_WL_MODE:
@@ -1199,17 +1198,4 @@ def scan_market():
             logger.warning("[scan error] " + type(e).__name__ + ": " + str(e))
 
 
-# --- Post-define fixer (in case final_ was defined after our first wrapper) ---
-try:
-    if '_original_final_' not in globals() and 'final_' in globals():
-        _original_final_ = final_
-        class _AllowAllSet(set):
-            def __contains__(self, item):
-                return True
-        def final_():
-            wl = set(_original_final_())
-            if _MODE in ("off", "permissive"):
-                return _AllowAllSet(wl)
-            return wl
-except Exception:
-    pass
+# Whitelist finale totalement retirée
