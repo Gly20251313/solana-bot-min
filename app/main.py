@@ -729,6 +729,10 @@ def is_in_final_(mint: str) -> bool:
     # Toujours vrai : tout token est autorisé
     return True
 
+(mint: str) -> bool:
+    # Toujours vrai : tout token est autorisé
+    return True
+
 def is_in_final_(mint: str) -> bool:
     return True
     """Respect FINAL_WL_MODE if present. If off -> always True."""
