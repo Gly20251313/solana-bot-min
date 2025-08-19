@@ -93,7 +93,7 @@ JUP_SWAP_URL  = "https://lite-api.jup.ag/swap/v1/swap"
 PRICE_API     = f"https://lite-api.jup.ag/price/v3?ids={WSOL}"
 JUP_TOKEN_LIST = "https://token.jup.ag/all"
 
-DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
+DEX_SCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/pairs/solana"
 DEX_TOKENS_BY_MINT  = "https://api.dexscreener.com/tokens/v1/solana"  # /{mint}
 
 GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2")
