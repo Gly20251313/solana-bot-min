@@ -709,17 +709,15 @@ def refresh_dynamic_tokens():
             found.add(base_mint)
             per_quote[quote_sym] = per_quote.get(quote_sym, 0) + 1
 
-        try:
         DYNAMIC_TOKENS = found
         save_dynamic_tokens()
 
         sample = list(DYNAMIC_TOKENS)[:LOG_SAMPLE_LIMIT]
         logger.info(f"[dyn] tokens={len(DYNAMIC_TOKENS)} sample={','.join([short_mint(x) for x in sample])}")
-        send("✅ dynamic=" + str(len(DYNAMIC_TOKENS))
+        send("✅ dynamic="+str(len(DYNAMIC_TOKENS))
              + f" (rejets liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote}, dupe={rej_dupe})")
         return DYNAMIC_TOKENS
     except Exception as e:
-        log(f"[⚠️ exception] {e}")
 
 def final_() -> set:
     # Whitelist finale désactivée : on ne filtre plus rien
