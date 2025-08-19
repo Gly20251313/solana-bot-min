@@ -82,14 +82,6 @@ MAX_DEBUG_SENDS_PER_SCAN = int(os.getenv("MAX_DEBUG_SENDS_PER_SCAN", "6"))
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("bot")
 
-# Simple logging helper so `log()` calls don't crash
-def log(msg: str):
-    try:
-        logger.warning(msg)
-    except Exception:
-        print(msg)
-
-
 # ======================
 # Constants & Endpoints
 # ======================
@@ -133,8 +125,7 @@ def send(msg: str):
         requests.get("https://api.telegram.org/bot"+TOKEN+"/sendMessage",
                      params={"chat_id": CHAT, "text": msg}, timeout=10)
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.error("telegram error: "+str(e))
 
 def send_to(chat_id: str, msg: str):
     if not TOKEN:
@@ -143,24 +134,21 @@ def send_to(chat_id: str, msg: str):
         requests.get("https://api.telegram.org/bot"+TOKEN+"/sendMessage",
                      params={"chat_id": chat_id, "text": msg}, timeout=10)
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.error("telegram send_to error: "+str(e))
 
 def _load_tg_offset() -> int:
     try:
         if os.path.exists(TG_OFFSET_PATH):
             return int(json.load(open(TG_OFFSET_PATH)).get("offset", 0))
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        pass
     return 0
 
 def _save_tg_offset(offset: int):
     try:
         json.dump({"offset": offset}, open(TG_OFFSET_PATH, "w"))
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        pass
 
 # ======================
 # HTTP helpers
@@ -267,7 +255,7 @@ def get_sol_usd() -> float:
         price = float((entry or {}).get("usdPrice"))
         return price
     except Exception as e:
-        log("[⚠️ exception inconnue]")
+        logger.warning("prix SOL fallback 150 USD ("+str(e)+")")
         return 150.0
 
 def gecko_get(path, params=None, timeout=10):
@@ -318,8 +306,7 @@ def fetch_pairs() -> list:
                     if pid and pid not in seen:
                         seen.add(pid); results.append(pair)
             except Exception as e:
-                log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+                logger.debug(f"[fetch] gecko trending p{p} fail: {e}")
         for p in range(1, min(2, max(1, GECKO_PAGES)) + 1):
             try:
                 d = gecko_get("/networks/solana/new_pools",
@@ -330,8 +317,7 @@ def fetch_pairs() -> list:
                     if pid and pid not in seen:
                         seen.add(pid); results.append(pair)
             except Exception as e:
-                log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+                logger.debug(f"[fetch] gecko new_pools p{p} fail: {e}")
         logger.info(f"[fetch] source=GECKO pairs={len(results)} in {time.time()-t0:.2f}s")
         return results
 
@@ -344,8 +330,7 @@ def fetch_pairs() -> list:
         logger.info(f"[fetch] source=DexScreener pairs={len(out)} in {time.time()-t0:.2f}s")
         if out: return out
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.debug("[fetch] DexScreener fail: "+str(e))
 
     # Gecko fallback
     results, seen = [], set()
@@ -359,8 +344,7 @@ def fetch_pairs() -> list:
                 if pid and pid not in seen:
                     seen.add(pid); results.append(pair)
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            logger.debug(f"[fetch] gecko trending p{p} fail: {e}")
     for p in range(1, min(2, max(1, GECKO_PAGES)) + 1):
         try:
             d = gecko_get("/networks/solana/new_pools",
@@ -371,8 +355,7 @@ def fetch_pairs() -> list:
                 if pid and pid not in seen:
                     seen.add(pid); results.append(pair)
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            logger.debug(f"[fetch] gecko new_pools p{p} fail: {e}")
     logger.info(f"[fetch] source=Gecko-fallback pairs={len(results)} in {time.time()-t0:.2f}s")
     return results
 
@@ -381,6 +364,7 @@ def get_price_change_pct(pair: dict, window: str) -> float:
     val = pc.get(window)
     try: return float(val)
     except Exception: return float("nan")
+
 def pair_liquidity_usd(pair: dict) -> float: return float((pair.get("liquidity") or {}).get("usd") or 0.0)
 def pair_volume_h24_usd(pair: dict) -> float: return float((pair.get("volume") or {}).get("h24") or 0.0)
 
@@ -390,18 +374,18 @@ def pair_price_in_sol(pair: dict, sol_usd: float) -> float:
     if quote_sym and quote_sym.upper() in ("SOL","WSOL") and price_native:
         try: return float(price_native)
         except Exception: pass
-    log("[⚠️ exception inconnue]")
+    price_usd = pair.get("priceUsd")
     if price_usd:
         try: return float(price_usd) / max(sol_usd, 1e-9)
         except Exception: pass
-    log("[⚠️ exception inconnue]")
+    return float("nan")
 
 def pair_age_sec(pair: dict) -> float:
     ts = pair.get("pairCreatedAt")
     try:
         if ts: return max(0, (time.time()*1000 - float(ts)) / 1000.0)
     except Exception: pass
-    log("[⚠️ exception inconnue]")
+    return 0.0
 
 # ======================
 # Ranking / Scoring
@@ -468,9 +452,8 @@ def route_is_ed_relaxed(quote: dict, return_labels: bool=False):
         if '_MODE' in globals() and _MODE in {'off','permissive'}:
             return (True, ['*']) if return_labels else True
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
-    return route_is_ed(quote, return_labels=return_labels)
+        pass
+    return route_is_ed_relaxed(quote, return_labels=return_labels)
 
 
 # ======================
@@ -529,8 +512,7 @@ def get_balance_sol() -> float:
         lamports = (resp.get("result") or {}).get("value", 0)
         return lamports / 1_000_000_000
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.warning("get_balance_sol error: "+str(e)); return 0.0
 
 def get_token_balance(mint: str) -> int:
     try:
@@ -545,8 +527,7 @@ def get_token_balance(mint: str) -> int:
             if amt is not None: total += int(amt)
         return total
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        return 0
 
 # ======================
 # Utils
@@ -588,8 +569,7 @@ def refresh_token_map():
         save_token_map()
         logger.info(f"[tokenmap] mints={len(TOKEN_MAP)} symbols={len(SYMBOL_TO_MINT)}")
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.warning("refresh_token_map: "+str(e))
 
 def resolve_symbol_or_mint(val: str) -> Tuple[str, str]:
     s = val.strip()
@@ -606,8 +586,7 @@ def resolve_symbol_or_mint(val: str) -> Tuple[str, str]:
             mint2 = (best.get("baseToken") or {}).get("address")
             if mint2: return mint2, sym
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        pass
     return "", sym
 
 # =================
@@ -646,8 +625,7 @@ def probe_trade(mint: str, user_pubkey: str):
             txb64 = jup_swap_tx(q_buy, user_pubkey, use_dynamic=True)
             _ = sign_and_send(txb64)
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            if _is_jup_slippage_err(e):
                 logger.info("🧪 probe BUY retry slippage++")
                 q_buy = jup_quote(WSOL, mint, lamports, min(PROBE_SLIPPAGE_BPS*2, MAX_SLIPPAGE_BPS))
                 txb64 = jup_swap_tx(q_buy, user_pubkey, use_dynamic=True)
@@ -659,8 +637,7 @@ def probe_trade(mint: str, user_pubkey: str):
             txb64 = jup_swap_tx(q_sell, user_pubkey, use_dynamic=True)
             _ = sign_and_send(txb64)
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            if _is_jup_slippage_err(e):
                 logger.info("🧪 probe SELL retry slippage++")
                 q_sell = jup_quote(mint, WSOL, int(lamports * PROBE_SELL_FACTOR), min(PROBE_SLIPPAGE_BPS*2, MAX_SLIPPAGE_BPS))
                 txb64 = jup_swap_tx(q_sell, user_pubkey, use_dynamic=True)
@@ -670,8 +647,7 @@ def probe_trade(mint: str, user_pubkey: str):
 
         return True
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.warning("probe_trade: "+str(e)); send("🧪 probe exception: "+str(e)); return False
 
 # =================
 # Sizing & scoring
@@ -703,6 +679,7 @@ def refresh_dynamic_tokens():
         pairs = fetch_pairs()
         if not pairs:
             DYNAMIC_TOKENS = set(); save_dynamic_tokens()
+            send("⚠️ dynamic=0 (source vide)"); return DYNAMIC_TOKENS
 
         pairs = rank_candidates(pairs, sol_usd)
 
@@ -742,16 +719,14 @@ def refresh_dynamic_tokens():
              + f" (rejets liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote}, dupe={rej_dupe})")
         return DYNAMIC_TOKENS
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        send("⚠️ dynamic=0 (erreur: "+str(e)+")"); return set()
+
 def final_() -> set:
-    # Whitelist finale désactivée : on autorise tout
-    return set()
+    # Whitelist finale désactivée : on ne filtre plus rien
+    return set(DYNAMIC_TOKENS)
 
 def is_in_final_(mint: str) -> bool:
-    # Toujours vrai : tout token est autorisé
     return True
-True
 
 def is_in_final_(mint: str) -> bool:
     # Toujours vrai : tout token est autorisé
@@ -766,8 +741,7 @@ def is_in_final_(mint: str) -> bool:
         wl = final_()
         return mint in wl
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        return ('FINAL_WL_MODE' in globals() and not FINAL_WL_MODE)
 
 
 # ======================
@@ -778,7 +752,8 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
     base_mint = (pair.get("baseToken") or {}).get("address")
     base_sym  = (pair.get("baseToken") or {}).get("symbol") or "TOKEN"
     pair_url  = pair.get("url") or "https://dexscreener.com/solana"
-        if not base_mint or base_mint in positions or is_blacklisted(base_mint): return
+    wl = final_()
+    if not base_mint or base_mint in positions or base_mint not in wl or is_blacklisted(base_mint): return
     balance = get_balance_sol()
     size_sol = size_for_score(balance, score)
     if size_sol <= 0: return
@@ -801,8 +776,7 @@ def enter_trade(pair: dict, sol_usd: float, score: str):
         sig = sign_and_send(jup_swap_tx(q, str(kp.public_key), use_dynamic=True))
         send("📈 Achat "+base_sym+" ["+score+"]\nMontant: "+f"{size_sol:.4f}"+" SOL\nPair: "+pair_url+"\nID: "+trade_id+"\nTx: "+str(sig))
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        send("❌ Achat "+base_sym+" échoué: "+str(e)); return
 
     price_sol = pair_price_in_sol(pair, sol_usd)
     positions[base_mint] = {
@@ -824,8 +798,7 @@ def close_position(mint: str, symbol: str, reason: str) -> bool:
         send(reason+" "+symbol+"\nTx: "+str(sig))
         return True
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        send("❌ Vente "+symbol+" échouée: "+str(e)); return False
 
 def check_positions(sol_usd: float):
     to_close = []
@@ -841,8 +814,7 @@ def check_positions(sol_usd: float):
             price = pair_price_in_sol(pair, sol_usd)
             if math.isnan(price) or price <= 0: continue
         except Exception:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            continue
         if price > peak:
             pos["peak_price_sol"] = price; peak = price; save_positions()
         if entry and (entry - price) / entry >= STOP_LOSS_PCT:
@@ -914,10 +886,7 @@ def scan_market():
             logger.info(f"[scan] aucun trade ouvert — candidats={len(candidates)} dyn={len(DYNAMIC_TOKENS)}")
 
     except Exception as e:
-
-
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        send("⚠️ [scan error] "+type(e).__name__+": "+str(e))
 
 # ==============================
 # Diagnostics & résumés
@@ -927,25 +896,21 @@ def health_check():
     try:
         bal = get_balance_sol(); results["rpc"] = bal >= 0; results["balance"] = bal
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        results["rpc"] = False; results["balance"] = "err: "+str(e)
     try:
         p = get_sol_usd(); results["jup_price"] = p > 0; results["sol_usd"] = p
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        results["jup_price"] = False; results["sol_usd"] = "err: "+str(e)
     try:
         pairs = fetch_pairs(); results["dex_search"] = len(pairs) > 0; results["pairs_count"] = len(pairs)
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        results["dex_search"] = False; results["pairs_count"] = "err: "+str(e)
     try:
         test_amt = int(0.01 * 1_000_000_000)
         q = jup_quote(WSOL, USDC, test_amt, min(SLIPPAGE_BPS, 50))
         results["jup_quote"] = bool(q) and ("outAmount" in json.dumps(q))
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        results["jup_quote"] = False
     return results
 
 def send_boot_diagnostics():
@@ -1005,14 +970,13 @@ def handle_command(text: str, chat_id: str = None):
             sig2 = sign_and_send(jup_swap_tx(q2, str(kp.public_key), use_dynamic=True))
             send("✅ TestTrade OK\nBuy Tx: "+str(sig1)+"\nSell Tx: "+str(sig2))
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            send("❌ TestTrade error: "+str(e))
     elif tl.startswith("/refresh_tokens"):
         refresh_token_map(); refresh_dynamic_tokens()
     elif tl.startswith("/dyninfo"):
         try: refresh_dynamic_tokens()
         except Exception as e: send("/dyninfo erreur: "+str(e))
-    log("[⚠️ exception inconnue]")
+    elif tl.startswith("/forcebuy"):
         try:
             parts = t.split()
             if len(parts) < 3: send("Usage: /forcebuy <SYMBOL_ou_MINT> <montant_SOL>"); return
@@ -1031,15 +995,13 @@ def handle_command(text: str, chat_id: str = None):
             else:
                 send("Sonde anti-honeypot KO — /forcebuy annulé.")
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            send("/forcebuy erreur: "+str(e))
     elif tl.startswith("/reset_offset"):
         try:
             if os.path.exists(TG_OFFSET_PATH): os.remove(TG_OFFSET_PATH)
             send("♻️ Telegram offset reset. Réessayez vos commandes.")
         except Exception as e:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            send("reset_offset erreur: "+str(e))
     elif tl.startswith("/whoami"):
         if chat_id: send_to(chat_id, "Votre chat_id: "+chat_id)
         else: send("(whoami) chat_id indisponible")
@@ -1066,8 +1028,7 @@ def poll_telegram():
             handle_command(text, chat_id)
         if last != offset: _save_tg_offset(last)
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.warning("poll_telegram: "+str(e))
 
 # ======================
 # Boot
@@ -1093,7 +1054,7 @@ def main():
     scheduler.add_job(scan_market, "interval", seconds=SCAN_INTERVAL_SEC, id="scan")
     scheduler.add_job(heartbeat, "interval", minutes=HEARTBEAT_MINUTES, id="heartbeat")
     scheduler.add_job(daily_summary, "cron", hour=21, minute=0, id="daily_summary")
-    scheduler.add_job(poll_telegram, "interval", seconds=15, id="tg_poll")
+    scheduler.add_job(poll_telegram, "interval", seconds=15, id="tg_poll")# (dyn disabled) scheduler.add_job(refresh_dynamic_tokens, "interval", minutes=10, id="dyn_refresh")
     scheduler.start()
 
     running = True
@@ -1117,8 +1078,7 @@ def _pair_name(p: dict) -> str:
         qs = (p.get("quoteToken") or {}).get("symbol") or ""
         return f"{bs}/{qs}" if qs else bs
     except Exception:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        return "PAIR"
 
 def _reject_log(p: dict, reason: str, detail: str = ""):
     if not ('DEBUG_REJECT' in globals() and DEBUG_REJECT):
@@ -1131,8 +1091,7 @@ def _reject_log(p: dict, reason: str, detail: str = ""):
         else:
             logger.info(f"[reject][{reason}] {nm} {url}")
     except Exception as e:
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        logger.debug("reject_log err: " + str(e))
 
 
 # ====================
@@ -1211,10 +1170,7 @@ def scan_market():
                 seen_mints.add(base_mint)
 
             except Exception as e:
-
-
-                log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+                logger.debug("[scan][pair] error: " + str(e))
                 continue
 
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -1234,20 +1190,15 @@ def scan_market():
                     continue
                 enter_trade(p, sol_usd, score)
             except Exception as e:
-                log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+                logger.debug("[scan][enter] " + str(e))
 
         check_positions(sol_usd)
 
     except Exception as e:
-
-
-        log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+        try:
             send("⚠️ [scan error] " + type(e).__name__ + ": " + str(e))
         except Exception:
-            log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
+            logger.warning("[scan error] " + type(e).__name__ + ": " + str(e))
 
 
 # Whitelist finale totalement retirée
