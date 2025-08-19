@@ -268,7 +268,6 @@ def get_sol_usd() -> float:
         return price
     except Exception as e:
         log("[⚠️ exception inconnue]")
-    log("[⚠️ exception inconnue]")
         return 150.0
 
 def gecko_get(path, params=None, timeout=10):
@@ -916,6 +915,7 @@ def scan_market():
 
     except Exception as e:
 
+
         log("[⚠️ exception inconnue]")
     log("[⚠️ exception inconnue]")
 
@@ -1212,6 +1212,7 @@ def scan_market():
 
             except Exception as e:
 
+
                 log("[⚠️ exception inconnue]")
     log("[⚠️ exception inconnue]")
                 continue
@@ -1239,6 +1240,7 @@ def scan_market():
         check_positions(sol_usd)
 
     except Exception as e:
+
 
         log("[⚠️ exception inconnue]")
     log("[⚠️ exception inconnue]")
