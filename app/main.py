@@ -722,9 +722,11 @@ def refresh_dynamic_tokens():
         send("⚠️ dynamic=0 (erreur: "+str(e)+")"); return set()
 
 def final_() -> set:
-    # Whitelist finale désactivée : on ne filtre plus rien
-    return set(DYNAMIC_TOKENS)
-
+    # Whitelist finale désactivée : tout autorisé via __contains__=True
+    class _AllSet:
+        def __contains__(self, item):
+            return True
+    return _AllSet()
 def is_in_final_(mint: str) -> bool:
     return True
 
@@ -826,6 +828,81 @@ def check_positions(sol_usd: float):
     for m in to_close: positions.pop(m, None)
     if to_close: save_positions()
 
+# --------------------
+# Debug reject reasons
+# --------------------
+def _safe_get(d, *path, default=None):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+    return cur if cur is not None else default
+
+def pair_liquidity_usd_any(pair) -> float:
+    try:
+        return float(_safe_get(pair, "liquidity", "usd", default=_safe_get(pair, "liq", default=0)) or 0)
+    except Exception:
+        return 0.0
+
+def pair_volume_h24_usd_any(pair) -> float:
+    v = _safe_get(pair, "volume", "h24", default=_safe_get(pair, "vol24", default=0))
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+def pair_m5_any(pair) -> float:
+    v = _safe_get(pair, "priceChange", "m5", default=_safe_get(pair, "m5", default=0))
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+def pair_age_sec_any(pair) -> int:
+    t = (_safe_get(pair, "pairCreatedAt") or _safe_get(pair, "created_at") or _safe_get(pair, "createdAt"))
+    if not t:
+        return 10**9
+    try:
+        t = int(t)
+    except Exception:
+        return 10**9
+    if t > 10**12:
+        t //= 1000
+    now = int(time.time())
+    return max(0, now - t)
+
+def reject_reasons(pair, min_liq_usd: float, min_vol_usd: float, min_age_sec: int, threshold_ratio: float, min_m5_change: float):
+    reasons = []
+    liq_usd = pair_liquidity_usd_any(pair)
+    vol_usd = pair_volume_h24_usd_any(pair)
+    age_sec = pair_age_sec_any(pair)
+    m5 = pair_m5_any(pair)
+    dex = (pair.get("dexId") or "").lower()
+    quote = ((_safe_get(pair, "quoteToken", "symbol") or _safe_get(pair, "quoteToken", "name") or "") or "").upper().strip()
+    try:
+        allowed_protocols_set = {p.strip().lower() for p in (ALLOWED_PROTOCOLS or "").split(",") if p.strip()}
+    except NameError:
+        allowed_protocols_set = set()
+    try:
+        allowed_quotes_set = {q.strip().upper() for q in (ALLOWED_QUOTES or "").split(",") if q.strip()}
+    except NameError:
+        allowed_quotes_set = set()
+    if allowed_protocols_set and dex not in allowed_protocols_set:
+        reasons.append(f"dex non autorisé: {dex or 'N/A'}")
+    if allowed_quotes_set and quote and quote not in allowed_quotes_set:
+        reasons.append(f"quote non autorisée: {quote or 'N/A'}")
+    if min_liq_usd and liq_usd < min_liq_usd:
+        reasons.append(f"liq<{min_liq_usd:.0f}$ (={liq_usd:.0f}$)")
+    if min_vol_usd and vol_usd < min_vol_usd:
+        reasons.append(f"vol24<{min_vol_usd:.0f}$ (={vol_usd:.0f}$)")
+    if min_age_sec and age_sec < min_age_sec:
+        reasons.append(f"age<{min_age_sec}s (={age_sec}s)")
+    if min_m5_change and m5 < min_m5_change:
+        reasons.append(f"m5<{min_m5_change:.1f}% (={m5:.1f}%)")
+    if threshold_ratio and m5 < threshold_ratio * 100.0:
+        reasons.append(f"m5<{threshold_ratio*100:.1f}% threshold (={m5:.1f}%)")
+    return reasons
 # ====================
 # Market scan
 # ====================
@@ -849,7 +926,7 @@ def scan_market():
             if not base_mint: continue
             if base_mint not in wl:
                 if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
-                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: hors  finale"; logger.info(msg); send(msg); debug_sent += 1
+                    msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: non présent dans final WL"; logger.info(msg); send(msg); debug_sent += 1
                 continue
 
             liq_usd = pair_liquidity_usd(p)
@@ -863,7 +940,7 @@ def scan_market():
                 if age < MIN_POOL_AGE_SEC: reasons.append(f"age {int(age)}<{MIN_POOL_AGE_SEC}s")
                 if reasons:
                     if DEBUG_REJECTIONS and debug_sent < MAX_DEBUG_SENDS_PER_SCAN:
-                        msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: "+", ".join(reasons); logger.info(msg); send(msg); debug_sent += 1
+                        msg = f"🔎 SKIP {base_sym} {short_mint(base_mint)}: "+"; ".join(reasons); logger.info(msg); send(msg); debug_sent += 1
                     continue
 
             chg = get_price_change_pct(p, PRICE_WINDOW)
@@ -1177,10 +1254,6 @@ def scan_market():
 
         if not candidates:
             logger.info("[scan] aucun trade ouvert — candidats=0 dyn=" + str(len(DYNAMIC_TOKENS)))
-        else:
-            logger.info("[scan] candidats=" + str(len(candidates)) + " dyn=" + str(len(DYNAMIC_TOKENS)))
-
-        for chg, score, p in candidates:
             try:
                 if not can_open_more():
                     break
@@ -1199,6 +1272,3 @@ def scan_market():
             send("⚠️ [scan error] " + type(e).__name__ + ": " + str(e))
         except Exception:
             logger.warning("[scan error] " + type(e).__name__ + ": " + str(e))
-
-
-# Whitelist finale totalement retirée
