@@ -332,7 +332,8 @@ def fetch_pairs() -> list:
         data = r.json() or {}
         pairs = data.get("pairs", []) or []
         out = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
-        logger.info(f"[fetch] source=DexScreener pairs={len(out)} in {time.time()-t0:.2f}s")
+        logger.info(f"[fetch] source=Gecko pairs={len(out)} in {time.time()-t0:.2f}s")
+        logger.info(f"[debug] fetch done: pairs={len(pairs)} seuils: liq>={MIN_LIQUIDITY}, m5>={MIN_M5_CHANGE}, vol>={MIN_VOL_SOL}")
         if out: return out
     except Exception as e:
         logger.debug("[fetch] DexScreener fail: "+str(e))
@@ -362,6 +363,7 @@ def fetch_pairs() -> list:
         except Exception as e:
             logger.debug(f"[fetch] gecko new_pools p{p} fail: {e}")
     logger.info(f"[fetch] source=Gecko-fallback pairs={len(results)} in {time.time()-t0:.2f}s")
+        logger.info(f"[debug] fetch done: pairs={len(pairs)} seuils: liq>={MIN_LIQUIDITY}, m5>={MIN_M5_CHANGE}, vol>={MIN_VOL_SOL}")
     return results
 
 def get_price_change_pct(pair: dict, window: str) -> float:
