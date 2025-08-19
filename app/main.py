@@ -679,7 +679,6 @@ def refresh_dynamic_tokens():
         pairs = fetch_pairs()
         if not pairs:
             DYNAMIC_TOKENS = set(); save_dynamic_tokens()
-            send("⚠️ dynamic=0 (source vide)"); return DYNAMIC_TOKENS
 
         pairs = rank_candidates(pairs, sol_usd)
 
@@ -719,7 +718,6 @@ def refresh_dynamic_tokens():
              + f" (rejets liq={rej_liq}, vol={rej_vol}, age={rej_age}, quote={rej_quote}, dupe={rej_dupe})")
         return DYNAMIC_TOKENS
     except Exception as e:
-        send("⚠️ dynamic=0 (erreur: "+str(e)+")"); return set()
 
 def final_() -> set:
     # Whitelist finale désactivée : on ne filtre plus rien
@@ -1057,7 +1055,6 @@ def main():
     scheduler.add_job(heartbeat, "interval", minutes=HEARTBEAT_MINUTES, id="heartbeat")
     scheduler.add_job(daily_summary, "cron", hour=21, minute=0, id="daily_summary")
     scheduler.add_job(poll_telegram, "interval", seconds=15, id="tg_poll")
-    scheduler.add_job(refresh_dynamic_tokens, "interval", minutes=10, id="dyn_refresh")
     scheduler.start()
 
     running = True
