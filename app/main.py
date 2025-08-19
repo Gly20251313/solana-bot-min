@@ -1,3 +1,8 @@
+# ==========================================================
+#  FINAL BOT VERSION - GeckoTerminal only + Detailed logging
+#  Date: 2025-08-19
+# ==========================================================
+
 # -*- coding: utf-8 -*-
 """
 Bot Solana — version 'full logs détaillés'
@@ -667,7 +672,7 @@ def size_for_score(balance_sol: float, score: str) -> float:
     return min(size_sol, balance_sol * 0.99)
 
 # ==========================
-# Dynamic 
+# Dynamic
 # ==========================
 def refresh_dynamic_tokens():
     global DYNAMIC_TOKENS
@@ -1069,7 +1074,7 @@ def main():
     try:
         while running: time.sleep(1)
     finally:
-        scheduler.shutdown(); print("[exit] bye")
+        scheduler.shutdown(); logger.info("[exit] bye")
 
 if __name__ == "__main__":
     main()
