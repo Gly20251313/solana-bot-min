@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import random
+import requests
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
@@ -19,6 +20,7 @@ DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 21))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+PHANTOM_PRIVATE_KEY = os.getenv("PHANTOM_PRIVATE_KEY", "")
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -62,7 +64,7 @@ class TradeExecutor:
 
     def simulate_buy_sell(self, token: dict) -> bool:
         """Mini test achat/revente pour détecter honeypot"""
-        success = random.choice([True, True, True, False])  # 75% safe en simul
+        success = random.choice([True, True, True, False])  # 75% safe en simu
         if not success:
             logging.warning(f"Sonde échouée sur {token['symbol']} (honeypot détecté)")
         return success
@@ -72,7 +74,7 @@ class TradeExecutor:
             logging.info(f"[SIMU] Achat de {token['symbol']} avec {TRADE_SIZE*100}% du capital.")
         else:
             logging.info(f"[REAL] Achat exécuté sur {token['symbol']} ✅")
-            # Ici tu mets ton appel Jupiter/Phantom réel
+            # Ici on brancherait l'appel Jupiter/Phantom avec PHANTOM_PRIVATE_KEY
         trade = {
             "symbol": token["symbol"],
             "entry_price": token.get("price", 1.0),
@@ -123,17 +125,63 @@ class TelegramBot:
 class MarketScanner:
     def fetch_new_tokens(self):
         try:
-            # Simulation multi-source (DexScreener + fallback Gecko)
-            tokens = [
-                {"symbol": "USDC", "score": random.uniform(0, 3), "price": 1.0, "lp_locked": True, "tax": 0, "supply": 10_000_000},
-                {"symbol": "JUP", "score": random.uniform(0, 3), "price": 0.8, "lp_locked": True, "tax": 2, "supply": 2_000_000},
-                {"symbol": "BTC", "score": random.uniform(0, 3), "price": 65_000, "lp_locked": True, "tax": 1, "supply": 21_000_000},
-                {"symbol": "ETH", "score": random.uniform(0, 3), "price": 3_200, "lp_locked": True, "tax": 1, "supply": 120_000_000},
-            ]
-            return tokens
+            # Source principale : DexScreener
+            r = requests.get("https://api.dexscreener.com/latest/dex/tokens")
+            if r.status_code == 200:
+                data = r.json()
+                tokens = []
+                for t in data.get("pairs", [])[:5]:  # On limite à 5 pour éviter surcharge
+                    tokens.append({
+                        "symbol": t.get("baseToken", {}).get("symbol", "UNK"),
+                        "price": float(t.get("priceUsd", 0)),
+                        "score": random.uniform(0, 3),
+                        "lp_locked": True,
+                        "tax": random.randint(0, 5),
+                        "supply": random.randint(1000, 1_000_000)
+                    })
+                return tokens
         except Exception as e:
             logging.error(f"Erreur DexScreener: {e}")
-            return []
+
+        # Fallback Birdeye
+        try:
+            r = requests.get("https://public-api.birdeye.so/public/tokenlist?sort_by=market_cap&sort_type=desc&offset=0&limit=5", headers={"x-chain": "solana"})
+            if r.status_code == 200:
+                data = r.json()
+                tokens = []
+                for t in data.get("data", {}).get("tokens", []):
+                    tokens.append({
+                        "symbol": t.get("symbol", "UNK"),
+                        "price": float(t.get("price", 0)),
+                        "score": random.uniform(0, 3),
+                        "lp_locked": True,
+                        "tax": random.randint(0, 5),
+                        "supply": random.randint(1000, 1_000_000)
+                    })
+                return tokens
+        except Exception as e:
+            logging.error(f"Erreur Birdeye: {e}")
+
+        # Fallback CoinGecko
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/coins/markets", params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 5})
+            if r.status_code == 200:
+                data = r.json()
+                tokens = []
+                for t in data:
+                    tokens.append({
+                        "symbol": t.get("symbol", "UNK").upper(),
+                        "price": float(t.get("current_price", 0)),
+                        "score": random.uniform(0, 3),
+                        "lp_locked": True,
+                        "tax": 0,
+                        "supply": t.get("circulating_supply", 1_000_000)
+                    })
+                return tokens
+        except Exception as e:
+            logging.error(f"Erreur CoinGecko: {e}")
+
+        return []
 
     def score_token(self, token: dict) -> float:
         return token.get("score", 0)
