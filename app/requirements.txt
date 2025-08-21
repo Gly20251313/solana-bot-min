@@ -1,5 +1,5 @@
-aiohttp
-python-telegram-bot>=20
-solana>=0.30
-solders>=0.18
-base58
+aiohttp>=3.9.0
+python-telegram-bot>=20.7
+solana>=0.30.0
+solders>=0.18.0
+base58>=2.1.1
