@@ -1,6 +1,6 @@
 requests==2.32.3
 pytz==2024.1
-apscheduler==3.10.4
+apscheduler==3.6.3
 base58==2.1.1
 solana==0.25.0
 python-telegram-bot==13.15
