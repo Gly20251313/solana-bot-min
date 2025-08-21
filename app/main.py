@@ -72,8 +72,12 @@ class TradeExecutor:
         self.trades = []
         self.client = Client(RPC_ENDPOINT)
         if PHANTOM_PRIVATE_KEY:
-            secret = base58.b58decode(PHANTOM_PRIVATE_KEY)
-            self.keypair = Keypair.from_secret_key(secret)
+            try:
+                secret = base58.b58decode(PHANTOM_PRIVATE_KEY)
+                self.keypair = Keypair.from_bytes(secret)
+            except Exception as e:
+                logging.error(f"Erreur chargement clé privée Phantom: {e}")
+                self.keypair = None
         else:
             self.keypair = None
 
