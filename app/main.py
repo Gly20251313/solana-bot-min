@@ -8,6 +8,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# Solana / Jupiter
+import base58
+from solana.keypair import Keypair
+from solana.rpc.api import Client
+
 # ==================== CONFIGURATION ====================
 MODE = os.getenv("MODE", "SIMU")  # SIMU ou REAL
 ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", 2.1))
@@ -21,6 +26,10 @@ DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 21))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PHANTOM_PRIVATE_KEY = os.getenv("PHANTOM_PRIVATE_KEY", "")
+
+RPC_ENDPOINT = os.getenv("RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")
+JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -61,10 +70,16 @@ class RiskManager:
 class TradeExecutor:
     def __init__(self):
         self.trades = []
+        self.client = Client(RPC_ENDPOINT)
+        if PHANTOM_PRIVATE_KEY:
+            secret = base58.b58decode(PHANTOM_PRIVATE_KEY)
+            self.keypair = Keypair.from_secret_key(secret)
+        else:
+            self.keypair = None
 
     def simulate_buy_sell(self, token: dict) -> bool:
         """Mini test achat/revente pour détecter honeypot"""
-        success = random.choice([True, True, True, False])  # 75% safe en simu
+        success = random.choice([True, True, True, False])  # 75% safe
         if not success:
             logging.warning(f"Sonde échouée sur {token['symbol']} (honeypot détecté)")
         return success
@@ -73,8 +88,30 @@ class TradeExecutor:
         if MODE == "SIMU":
             logging.info(f"[SIMU] Achat de {token['symbol']} avec {TRADE_SIZE*100}% du capital.")
         else:
-            logging.info(f"[REAL] Achat exécuté sur {token['symbol']} ✅")
-            # Ici on brancherait l'appel Jupiter/Phantom avec PHANTOM_PRIVATE_KEY
+            if not self.keypair:
+                logging.error("❌ Clé privée Phantom manquante")
+                return
+            try:
+                # Exemple swap SOL -> token via Jupiter
+                quote_params = {
+                    "inputMint": "So11111111111111111111111111111111111111112", # SOL
+                    "outputMint": token.get("mint", "So11111111111111111111111111111111111111112"),
+                    "amount": 1000000,  # en lamports (ici 0.001 SOL)
+                    "slippageBps": 50
+                }
+                q = requests.get(JUPITER_QUOTE_API, params=quote_params).json()
+                swap_body = {
+                    "quoteResponse": q,
+                    "userPublicKey": str(self.keypair.public_key),
+                    "wrapUnwrapSOL": True
+                }
+                swap_tx = requests.post(JUPITER_SWAP_API, json=swap_body).json()
+                raw_tx = base58.b58decode(swap_tx["swapTransaction"])
+                tx = self.client.send_raw_transaction(raw_tx)
+                logging.info(f"[REAL] Achat exécuté sur {token['symbol']} ✅ TX={tx}")
+            except Exception as e:
+                logging.error(f"Erreur trade Jupiter: {e}")
+
         trade = {
             "symbol": token["symbol"],
             "entry_price": token.get("price", 1.0),
@@ -124,15 +161,16 @@ class TelegramBot:
 # ==================== MARKET SCANNER ====================
 class MarketScanner:
     def fetch_new_tokens(self):
+        # 1. DexScreener
         try:
-            # Source principale : DexScreener
             r = requests.get("https://api.dexscreener.com/latest/dex/tokens")
             if r.status_code == 200:
                 data = r.json()
                 tokens = []
-                for t in data.get("pairs", [])[:5]:  # On limite à 5 pour éviter surcharge
+                for t in data.get("pairs", [])[:5]:
                     tokens.append({
                         "symbol": t.get("baseToken", {}).get("symbol", "UNK"),
+                        "mint": t.get("baseToken", {}).get("address"),
                         "price": float(t.get("priceUsd", 0)),
                         "score": random.uniform(0, 3),
                         "lp_locked": True,
@@ -142,8 +180,7 @@ class MarketScanner:
                 return tokens
         except Exception as e:
             logging.error(f"Erreur DexScreener: {e}")
-
-        # Fallback Birdeye
+        # 2. Birdeye
         try:
             r = requests.get("https://public-api.birdeye.so/public/tokenlist?sort_by=market_cap&sort_type=desc&offset=0&limit=5", headers={"x-chain": "solana"})
             if r.status_code == 200:
@@ -152,6 +189,7 @@ class MarketScanner:
                 for t in data.get("data", {}).get("tokens", []):
                     tokens.append({
                         "symbol": t.get("symbol", "UNK"),
+                        "mint": t.get("address"),
                         "price": float(t.get("price", 0)),
                         "score": random.uniform(0, 3),
                         "lp_locked": True,
@@ -161,8 +199,7 @@ class MarketScanner:
                 return tokens
         except Exception as e:
             logging.error(f"Erreur Birdeye: {e}")
-
-        # Fallback CoinGecko
+        # 3. CoinGecko
         try:
             r = requests.get("https://api.coingecko.com/api/v3/coins/markets", params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 5})
             if r.status_code == 200:
@@ -171,6 +208,7 @@ class MarketScanner:
                 for t in data:
                     tokens.append({
                         "symbol": t.get("symbol", "UNK").upper(),
+                        "mint": t.get("id"),
                         "price": float(t.get("current_price", 0)),
                         "score": random.uniform(0, 3),
                         "lp_locked": True,
@@ -180,7 +218,6 @@ class MarketScanner:
                 return tokens
         except Exception as e:
             logging.error(f"Erreur CoinGecko: {e}")
-
         return []
 
     def score_token(self, token: dict) -> float:
