@@ -5,8 +5,10 @@ import random
 import requests
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
+
+# Telegram v13.15
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
 # Solana / Jupiter
 import base58
@@ -74,7 +76,7 @@ class TradeExecutor:
         if PHANTOM_PRIVATE_KEY:
             try:
                 secret = base58.b58decode(PHANTOM_PRIVATE_KEY)
-                self.keypair = Keypair.from_bytes(secret)
+                self.keypair = Keypair.from_secret_key(secret)
             except Exception as e:
                 logging.error(f"Erreur chargement clé privée Phantom: {e}")
                 self.keypair = None
@@ -128,39 +130,43 @@ class TradeExecutor:
 
 # ==================== TELEGRAM BOT ====================
 class TelegramBot:
-    def __init__(self):
+    def __init__(self, executor, risk):
         self.enabled = True
+        self.executor = executor
+        self.risk = risk
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-            self.app = Application.builder().token(TELEGRAM_TOKEN).build()
-            self.app.add_handler(CommandHandler("start", self.cmd_start))
-            self.app.add_handler(CommandHandler("stop", self.cmd_stop))
-            self.app.add_handler(CommandHandler("status", self.cmd_status))
+            self.updater = Updater(TELEGRAM_TOKEN, use_context=True)
+            dp = self.updater.dispatcher
+            dp.add_handler(CommandHandler("start", self.cmd_start))
+            dp.add_handler(CommandHandler("stop", self.cmd_stop))
+            dp.add_handler(CommandHandler("status", self.cmd_status))
         else:
-            self.app = None
+            self.updater = None
 
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def cmd_start(self, update: Update, context: CallbackContext):
         self.enabled = True
-        await update.message.reply_text("✅ Bot activé.")
+        update.message.reply_text("✅ Bot activé.")
 
-    async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def cmd_stop(self, update: Update, context: CallbackContext):
         self.enabled = False
-        await update.message.reply_text("🛑 Bot stoppé.")
+        update.message.reply_text("🛑 Bot stoppé.")
 
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def cmd_status(self, update: Update, context: CallbackContext):
         status = "✅ Actif" if self.enabled else "⏸️ Inactif"
-        await update.message.reply_text(f"Status bot : {status}\nTrades ouverts : {len(risk.open_trades)}")
+        update.message.reply_text(f"Status bot : {status}\nTrades ouverts : {len(self.risk.open_trades)}")
 
     def send_alert(self, msg: str):
-        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and self.updater:
             try:
-                self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                self.updater.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
             except Exception as e:
                 logging.error(f"Erreur envoi Telegram: {e}")
         logging.info(f"[TELEGRAM] {msg}")
 
     def run(self):
-        if self.app:
-            self.app.run_polling()
+        if self.updater:
+            self.updater.start_polling()
+            self.updater.idle()
 
 # ==================== MARKET SCANNER ====================
 class MarketScanner:
@@ -231,11 +237,10 @@ class MarketScanner:
 def main():
     logging.info("🚀 Démarrage du bot trading...")
 
-    global risk
     scanner = MarketScanner()
     risk = RiskManager()
     executor = TradeExecutor()
-    telegram = TelegramBot()
+    telegram = TelegramBot(executor, risk)
     tokenomics = TokenomicsChecker()
     scheduler = BackgroundScheduler()
 
@@ -268,15 +273,7 @@ def main():
     scheduler.start()
 
     logging.info("✅ Scheduler démarré.")
-    if telegram.app:
-        telegram.run()
-    else:
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logging.info("⏹️ Arrêt du bot...")
-            scheduler.shutdown()
+    telegram.run()
 
 if __name__ == "__main__":
     main()
