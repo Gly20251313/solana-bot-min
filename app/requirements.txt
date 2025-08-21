@@ -3,3 +3,5 @@ pytz==2024.1
 apscheduler==3.10.4
 base58==2.1.1
 solana==0.25.0
+python-telegram-bot==20.7
+python-dotenv==1.0.1
